@@ -1,0 +1,14 @@
+# Normalise line endings. Without this, a Windows `core.autocrlf=true` rewrites
+# the shell scripts to CRLF on checkout and bash then fails with
+# "$'\r': command not found" — which is exactly the kind of thing that wastes an
+# afternoon.
+* text=auto eol=lf
+
+# PowerShell is happier with CRLF.
+*.ps1 text eol=crlf
+
+# Never touch binaries.
+*.exe binary
+*.dll binary
+*.dat binary
+*.7z binary

@@ -1,0 +1,467 @@
+module engine
+
+
+// ---------------------------------------------------------------------------
+// Ultralight engine  —  WebKit + JavaScriptCore (NO V8)
+//
+// Ultralight 2.0.0-beta.2 C API. Signatures taken verbatim from the SDK headers:
+//   include/AppCore/CAPI.h                 -> ulCreateApp, ulAppRun, ulCreateWindow, ...
+//   include/AppCore/CAPI/CAPI_Layout.h     -> ulWindowAddPanel, ulPanelGetView
+//   include/Ultralight/CAPI/CAPI_String.h  -> ulCreateString, ulDestroyString
+//   include/Ultralight/CAPI/CAPI_View.h    -> ulViewLoadURL, ulDestroyView
+//
+// The headers are NOT #included: their typedefs use `__declspec(dllimport)` and
+// C++-ish constructs V's C translator would have to reproduce. We declare only
+// the handful of functions we call, with ABI-compatible V types (every opaque
+// handle is a `voidptr`). Reference-counting rule from the SDK: destroy only
+// what YOU create — ulPanelGetView() hands back an owned reference we release.
+//
+// Build (from vshell/):
+//   v -cc gcc -o vshell.exe .
+// The #flag lines below add the SDK include/lib dirs; the SDK DLLs in
+// .work/ul-sdk/bin must sit next to vshell.exe (or be on PATH) at runtime.
+// ---------------------------------------------------------------------------
+
+#flag -I@VMODROOT/.work/ul-sdk/include
+#flag -L@VMODROOT/.work/ul-sdk/lib
+#flag -lAppCore
+#flag -lUltralight
+#flag -lUltralightCore
+#flag -lWebCore
+
+// --- opaque handles (typedef struct C_X* ULX) -------------------------------
+pub type ULConfig = voidptr
+pub type ULRenderer = voidptr
+pub type ULApp = voidptr
+pub type ULWindow = voidptr
+pub type ULView = voidptr
+pub type ULPanel = voidptr
+pub type ULMonitor = voidptr
+pub type ULString = voidptr
+pub type ULSettings = voidptr
+pub type ULViewConfig = voidptr
+pub type ULJSAPI = voidptr
+pub type ULJSContext = voidptr
+pub type ULJSValue = voidptr
+
+// --- window flags (AppCore/CAPI.h) -----------------------------------------
+pub const k_window_flags_borderless = 1 << 0
+pub const k_window_flags_titled = 1 << 1
+pub const k_window_flags_resizable = 1 << 2
+pub const k_window_flags_maximizable = 1 << 3
+pub const k_window_flags_hidden = 1 << 4
+
+// --- callbacks (C function pointers) ---------------------------------------
+type ULCloseCallback = fn (user_data voidptr, window ULWindow)
+
+// Invoked on the renderer's thread while page script runs.
+type ULJSFunctionCallback = fn (user_data voidptr, ctx ULJSContext, this_value ULJSValue, args &ULJSValue, argc usize, exception &ULJSValue) ULJSValue
+
+// --- C API (only what we call) ---------------------------------------------
+fn C.ulCreateApp(settings ULSettings, config ULConfig) ULApp
+fn C.ulDestroyApp(app ULApp)
+fn C.ulAppRun(app ULApp)
+fn C.ulAppQuit(app ULApp)
+fn C.ulAppIsRunning(app ULApp) bool
+fn C.ulAppGetMainMonitor(app ULApp) ULMonitor
+
+fn C.ulCreateWindow(monitor ULMonitor, width f64, height f64, fullscreen bool, window_flags u32) ULWindow
+fn C.ulDestroyWindow(window ULWindow)
+fn C.ulWindowSetTitle(window ULWindow, title &char)
+fn C.ulWindowSetCloseCallback(window ULWindow, callback ULCloseCallback, user_data voidptr, destroy_user_data voidptr)
+fn C.ulWindowAddPanel(window ULWindow, desc voidptr, view_config ULViewConfig) ULPanel
+
+fn C.ulPanelGetView(panel ULPanel) ULView
+fn C.ulDestroyPanel(panel ULPanel)
+
+fn C.ulViewLoadURL(view ULView, url_string ULString)
+fn C.ulViewLoadHTML(view ULView, html_string ULString)
+fn C.ulDestroyView(view ULView)
+
+fn C.ulCreateString(str &char) ULString
+fn C.ulDestroyString(str ULString)
+fn C.ulStringGetData(str ULString) voidptr
+fn C.ulStringGetLength(str ULString) usize
+fn C.ulStringIsEmpty(str ULString) bool
+
+fn C.ulCreateConfig() ULConfig
+fn C.ulDestroyConfig(config ULConfig)
+fn C.ulConfigSetDeveloperMode(config ULConfig, developer_mode bool)
+
+fn C.ulAppGetRenderer(app ULApp) ULRenderer
+fn C.ulStartRemoteInspectorServer(renderer ULRenderer, address &char, port u16) bool
+fn C.ulAppRunOnce(app ULApp, max_wait_seconds f64) bool
+
+fn C.ulViewEvaluateScript(view ULView, js_string ULString, exception &ULString) ULString
+
+fn C.ulCreateJSAPI(root_path &char) ULJSAPI
+fn C.ulDestroyJSAPI(api ULJSAPI)
+fn C.ulJSAPIBindFunction(api ULJSAPI, path &char, callback ULJSFunctionCallback, user_data voidptr, destroy_user_data voidptr) bool
+fn C.ulJSAPISetConstantString(api ULJSAPI, path &char, value &char) bool
+fn C.ulViewAttachJSAPI(view ULView, api ULJSAPI, flags u32, origin_rules voidptr, num_origin_rules usize) bool
+fn C.ulViewDetachJSAPI(view ULView, api ULJSAPI)
+fn C.ulJSValueToString(value ULJSValue, exception &ULJSValue) ULString
+fn C.ulCreateJSValueBoolean(ctx ULJSContext, value bool) ULJSValue
+
+// Invoked by the engine when the user closes the window: stops ulAppRun().
+fn ul_close_cb(user_data voidptr, _window ULWindow) {
+	if user_data != unsafe { nil } {
+		C.ulAppQuit(ULApp(user_data))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// JS <-> V bridge
+//
+// V -> JS is direct: ulViewEvaluateScript() (engine.eval_js()).
+// JS -> V is a REAL native function: ulCreateJSAPI() attaches a frozen object to
+// `window` whose functions are C callbacks, so page script can call
+//   vshell.post(name, payloadJsonString)
+// and it lands in a V-side inbox drained by the run loop — no polling of the page.
+//
+// The callback runs on the renderer's thread while script executes, so it only
+// appends to the inbox and never calls back into the engine.
+//
+// `payload` must be a string (pass JSON.stringify(obj) from the page); it is
+// converted with ulJSValueToString() and handed to V verbatim.
+// ---------------------------------------------------------------------------
+
+struct BridgeMsg {
+	name    string
+	payload string
+}
+
+// Heap-allocated so the pointer handed to ulJSAPIBindFunction() stays valid for
+// the engine's whole lifetime.
+struct BridgeInbox {
+mut:
+	msgs []BridgeMsg
+}
+
+// vshell.post(name, payload) — called by page script.
+fn js_post_cb(user_data voidptr, ctx ULJSContext, _this_value ULJSValue, args &ULJSValue, argc usize, _exception &ULJSValue) ULJSValue {
+	mut inbox := unsafe { &BridgeInbox(user_data) }
+	mut name := ''
+	mut payload := ''
+	// Read every argument BEFORE destroying anything. ulJSValueToString() hands
+	// back handles we own, but destroying one while another is still unread pulled
+	// the rug out from under it (the second string came back shifted).
+	mut owned := []ULString{}
+	if argc >= 1 {
+		s := C.ulJSValueToString(unsafe { args[0] }, unsafe { nil })
+		if s != unsafe { nil } {
+			name = ulstring_to_v(s)
+			owned << s
+		}
+	}
+	if argc >= 2 {
+		s := C.ulJSValueToString(unsafe { args[1] }, unsafe { nil })
+		if s != unsafe { nil } {
+			payload = ulstring_to_v(s)
+			owned << s
+		}
+	}
+	for s in owned {
+		C.ulDestroyString(s)
+	}
+	inbox.msgs << BridgeMsg{
+		name:    name
+		payload: payload
+	}
+	return C.ulCreateJSValueBoolean(ctx, true)
+}
+
+// Reads a ULString into a V string (leaves ownership with the caller).
+fn ulstring_to_v(s ULString) string {
+	if s == unsafe { nil } {
+		return ''
+	}
+	ptr := C.ulStringGetData(s)
+	n := C.ulStringGetLength(s)
+	if ptr == unsafe { nil } || n == 0 {
+		return ''
+	}
+	// Copy the bytes explicitly: `tos()` can hand back a string that aliases the
+	// library's buffer, and these buffers are reused between calls.
+	bytes := unsafe { ptr.vbytes(int(n)) }
+	return bytes.bytestr()
+}
+
+pub struct UltralightEngine {
+mut:
+	app     ULApp    = unsafe { nil }
+	window  ULWindow = unsafe { nil }
+	panel   ULPanel  = unsafe { nil }
+	view    ULView   = unsafe { nil }
+	config  ULConfig = unsafe { nil }
+	title   string
+	// C strings must outlive the calls that use them
+	keep    []ULString
+	// bridge state
+	inbox       &BridgeInbox = unsafe { nil }
+	jsapi       ULJSAPI      = unsafe { nil }
+	page_ready bool
+	eval_ticks int
+	pending    []string
+}
+
+pub fn (mut e UltralightEngine) create_window(title string, url string, width int, height int, dev_mode bool) ! {
+	e.title = title
+
+	// Own config so we can turn developer mode on (diagnostics + inspector);
+	// NULL settings keeps the library defaults.
+	e.config = C.ulCreateConfig()
+	C.ulConfigSetDeveloperMode(e.config, dev_mode)
+
+	// One App per process.
+	e.app = C.ulCreateApp(ULSettings(unsafe { nil }), e.config)
+	if e.app == unsafe { nil } {
+		return error('ulCreateApp() returned NULL (are the Ultralight DLLs on PATH?)')
+	}
+
+	monitor := C.ulAppGetMainMonitor(e.app)
+	flags := u32(k_window_flags_titled | k_window_flags_resizable | k_window_flags_maximizable)
+	e.window = C.ulCreateWindow(monitor, f64(width), f64(height), false, flags)
+	if e.window == unsafe { nil } {
+		return error('ulCreateWindow() returned NULL')
+	}
+	C.ulWindowSetTitle(e.window, title.str)
+	// Stop the run loop when the window is closed.
+	C.ulWindowSetCloseCallback(e.window, ul_close_cb, voidptr(e.app), unsafe { nil })
+
+	// NULL desc => full-window panel; NULL view config => window defaults.
+	e.panel = C.ulWindowAddPanel(e.window, unsafe { nil }, ULViewConfig(unsafe { nil }))
+	if e.panel == unsafe { nil } {
+		return error('ulWindowAddPanel() returned NULL')
+	}
+
+	e.view = C.ulPanelGetView(e.panel)
+	if e.view == unsafe { nil } {
+		return error('ulPanelGetView() returned NULL')
+	}
+
+	// Attach the native bridge BEFORE the page loads: an API attached later cannot
+	// add to a namespace object the page has already frozen.
+	e.attach_bridge(url)
+
+	e.load_url(url)!
+}
+
+// origin_rule turns "http://127.0.0.1:8123/foo" into the origin rule
+// "http://127.0.0.1:8123" (rules are `scheme://host[:port]`).
+fn origin_rule(url string) string {
+	i := url.index('://') or { return '' }
+	rest := url[i + 3..]
+	j := rest.index('/') or { rest.len }
+	return url[..i + 3 + j]
+}
+
+fn (mut e UltralightEngine) attach_bridge(url string) {
+	e.inbox = &BridgeInbox{}
+	e.jsapi = C.ulCreateJSAPI(c'vshell')
+	if e.jsapi == unsafe { nil } {
+		eprintln('vshell: ulCreateJSAPI() returned NULL; JS->V bridge disabled')
+		return
+	}
+	bound := C.ulJSAPIBindFunction(e.jsapi, c'post', js_post_cb, voidptr(e.inbox), unsafe { nil })
+	const_ok := C.ulJSAPISetConstantString(e.jsapi, c'version', c'vshell-bridge-2')
+
+	// The DEFAULT origin rules only cover file:// pages and directly-loaded HTML, so
+	// an http:// page (our Bun-served workbench) silently never receives the
+	// namespace. Pass an explicit rule for the origin we are loading.
+	rule := origin_rule(url)
+	mut rules := []&char{}
+	if rule != '' {
+		rules << rule.str
+	}
+	attached := C.ulViewAttachJSAPI(e.view, e.jsapi, u32(0), rules.data, usize(rules.len))
+
+	if !bound || !const_ok || !attached {
+		eprintln('vshell: bridge setup incomplete (bind=${bound} const=${const_ok} attach=${attached})')
+	}
+}
+
+pub fn (mut e UltralightEngine) load_url(url string) ! {
+	if e.view == unsafe { nil } {
+		return error('no view: call create_window() first')
+	}
+	s := C.ulCreateString(url.str)
+	if s == unsafe { nil } {
+		return error('ulCreateString() returned NULL')
+	}
+	e.keep << s
+	C.ulViewLoadURL(e.view, s)
+}
+
+pub fn (mut e UltralightEngine) load_html(html string) ! {
+	if e.view == unsafe { nil } {
+		return error('no view: call create_window() first')
+	}
+	s := C.ulCreateString(html.str)
+	if s == unsafe { nil } {
+		return error('ulCreateString() returned NULL')
+	}
+	e.keep << s
+	C.ulViewLoadHTML(e.view, s)
+}
+
+// run drives the app loop.
+//
+// It uses ulAppRunOnce() from V instead of ulAppRun() + an update callback on
+// purpose: evaluating JS **from inside** the engine's update callback deadlocks
+// (the renderer cannot make progress while we occupy its thread), which showed
+// up as the process wedging on the first bridge eval. Pumping between iterations
+// keeps the bridge on the V side, outside the renderer's own update.
+pub fn (mut e UltralightEngine) run() ! {
+	if e.app == unsafe { nil } {
+		return error('no app: call create_window() first')
+	}
+	// ~60 Hz: 0.0 would spin the loop at 100% CPU.
+	for C.ulAppRunOnce(e.app, 1.0 / 60.0) {
+		e.pump()
+	}
+}
+
+// --- bridge ----------------------------------------------------------------
+
+// eval_js evaluates `script` in the page and returns its value as a string
+// ('' when the script returns undefined). Returns an error on a JS exception.
+pub fn (mut e UltralightEngine) eval_js(script string) !string {
+	return e.eval_raw(script)
+}
+
+// queue_eval records a script to run once the page is live (see pump()).
+pub fn (mut e UltralightEngine) queue_eval(script string) {
+	e.pending << script
+}
+
+// start_remote_inspector tries to start the DevTools server (chrome://inspect
+// style access via `inspector://host:port` in another Ultralight app).
+// The SDK documents this as unavailable in the Free edition — it returns false
+// there, which is what we report honestly.
+pub fn (mut e UltralightEngine) start_remote_inspector(port int) bool {
+	if e.app == unsafe { nil } {
+		return false
+	}
+	r := C.ulAppGetRenderer(e.app)
+	if r == unsafe { nil } {
+		return false
+	}
+	return C.ulStartRemoteInspectorServer(r, c'127.0.0.1', u16(port))
+}
+
+fn (e UltralightEngine) eval_raw(script string) !string {
+	if e.view == unsafe { nil } {
+		return error('no view: call create_window() first')
+	}
+	s := C.ulCreateString(script.str)
+	if s == unsafe { nil } {
+		return error('ulCreateString() returned NULL')
+	}
+	defer {
+		C.ulDestroyString(s)
+	}
+	// `ulViewEvaluateScript` documents that BOTH the result and the exception are
+	// owned by the View: destroying them is an invalid free and crashes. The
+	// exception is an empty string (not NULL) when the script did not throw, and
+	// the result is empty while the page cannot run scripts yet.
+	mut exc := ULString(unsafe { nil })
+	res := C.ulViewEvaluateScript(e.view, s, &exc)
+	if exc != unsafe { nil } && !C.ulStringIsEmpty(exc) {
+		return error('JS exception: ${ulstring_to_v(exc)}')
+	}
+	if res == unsafe { nil } {
+		return ''
+	}
+	return ulstring_to_v(res)
+}
+
+// pump is the per-iteration bridge tick, driven from the run loop in V (not from
+// an engine update callback — see run()).
+fn (mut e UltralightEngine) pump() {
+	if e.view == unsafe { nil } {
+		return
+	}
+
+	// CLI evals run once the page is actually booted. readyState reaches "complete"
+	// while the document is still the bare host page (the workbench mounts seconds
+	// later), so wait until the body has content before reporting.
+	if !e.page_ready {
+		if rs := e.eval_raw('document.readyState') {
+			if rs == 'complete' {
+				e.page_ready = true
+			}
+		}
+	}
+	if e.page_ready && e.pending.len > 0 {
+		e.eval_ticks++
+		if e.eval_ticks % 60 == 0 {
+			body := e.eval_raw('document.body ? document.body.innerHTML.length : 0') or { '0' }
+			if body.int() > 0 || e.eval_ticks > 1200 {
+				for script in e.pending {
+					if rv := e.eval_raw(script) {
+						println('vshell: eval -> ${rv}')
+					} else {
+						eprintln('vshell: eval failed: ${err}')
+					}
+				}
+				e.pending = []
+			}
+		}
+	}
+
+	// Drain what page script pushed through vshell.post().
+	if e.inbox != unsafe { nil } && e.inbox.msgs.len > 0 {
+		for m in e.inbox.msgs {
+			eprintln('vshell: js->v ${m.name} ${m.payload}')
+		}
+		e.inbox.msgs = []
+	}
+}
+
+pub fn (mut e UltralightEngine) quit() {
+	if e.app != unsafe { nil } {
+		C.ulAppQuit(e.app)
+	}
+
+	for s in e.keep {
+		C.ulDestroyString(s)
+	}
+	e.keep = []
+
+	// Release the bridge before the View it is attached to.
+	if e.jsapi != unsafe { nil } {
+		if e.view != unsafe { nil } {
+			C.ulViewDetachJSAPI(e.view, e.jsapi)
+		}
+		C.ulDestroyJSAPI(e.jsapi)
+		e.jsapi = unsafe { nil }
+	}
+	e.inbox = unsafe { nil }
+
+	// ulPanelGetView() returned an owned reference: release it before the panel.
+	if e.view != unsafe { nil } {
+		C.ulDestroyView(e.view)
+		e.view = unsafe { nil }
+	}
+	if e.panel != unsafe { nil } {
+		C.ulDestroyPanel(e.panel)
+		e.panel = unsafe { nil }
+	}
+	// All windows must go before the App (SDK note on ulDestroyApp).
+	if e.window != unsafe { nil } {
+		C.ulDestroyWindow(e.window)
+		e.window = unsafe { nil }
+	}
+	if e.app != unsafe { nil } {
+		C.ulDestroyApp(e.app)
+		e.app = unsafe { nil }
+	}
+	if e.config != unsafe { nil } {
+		C.ulDestroyConfig(e.config)
+		e.config = unsafe { nil }
+	}
+	e.page_ready = false
+	e.eval_ticks = 0
+	e.pending = []
+}

@@ -1,0 +1,16 @@
+# build inputs: the cloned vscode checkout and the produced web build
+.work/
+
+# generated web assets: the whole tree is produced by scripts/build_web.sh
+web/public/
+
+# build output: the shell binary, the Ultralight DLLs and the resources staged
+# next to it (~25 MB of icudt67l.dat lives under bin/assets/resources)
+bin/
+
+# native artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.o

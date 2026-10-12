@@ -1,0 +1,42 @@
+module engine
+
+// ---------------------------------------------------------------------------
+// System webview fallback (for fast iteration, NOT the target engine).
+//
+// `ttytm.webview` wraps the `webview` C library, which uses:
+//   - Linux   : WebKitGTK          -> WebKit + JSC   ✅
+//   - macOS   : WKWebView          -> WebKit + JSC   ✅
+//   - Windows : WebView2           -> Chromium + V8  ❌ (breaks the "no V8" rule)
+//
+// Install the module first:  v install ttytm.webview
+//
+// Use it to iterate on the shell (window lifecycle, server handshake, menus)
+// before the Ultralight binding is ready. On Windows it will use V8; that is
+// expected and acceptable only for the fallback path.
+// ---------------------------------------------------------------------------
+
+import ttytm.webview
+
+pub struct SystemWebviewEngine {
+mut:
+	wv &webview.Webview = unsafe { nil }
+}
+
+pub fn (mut e SystemWebviewEngine) create_window(title string, url string, width int, height int) ! {
+	e.wv = webview.create()
+	e.wv.set_title(title)
+	e.wv.set_size(width, height, .none)
+	e.wv.navigate(url)
+}
+
+pub fn (mut e SystemWebviewEngine) load_url(url string) ! {
+	e.wv.navigate(url)
+}
+
+pub fn (mut e SystemWebviewEngine) run() ! {
+	e.wv.run()
+}
+
+pub fn (mut e SystemWebviewEngine) quit() {
+	e.wv.terminate()
+}

@@ -1,0 +1,29 @@
+// vshell workspace.
+//
+// vshell is a standalone project (its own git repo) that CONSUMES the VS Code fork,
+// so both folders are opened together and each one keeps its own git in the Source
+// Control view. Inside the fork's repo, `vshell/` would be invisible: its
+// .gitignore ignores `VS*` folders and on Windows that match is case-insensitive.
+{
+  "folders": [
+    {
+      // The VS Code / VSCodium fork (build inputs, patches, configuration).
+      "name": "codibun (vscode fork)",
+      "path": ".."
+    },
+    {
+      // The V shell: Ultralight binding, JS<->V bridge, Bun server.
+      "name": "vshell",
+      "path": "."
+    }
+  ],
+  "settings": {
+    // The generated artifacts are huge (the workbench bundle alone is ~38 MB, and
+    // the vscode checkout is tens of MB more): keep them out of searches so they
+    // do not drown the results.
+    "search.exclude": {
+      "**/.work": true,
+      "**/web/public": true
+    }
+  }
+}
