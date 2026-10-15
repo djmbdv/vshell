@@ -9,7 +9,7 @@
 #
 # Env:
 #   VSCODE_REPOSITORY  fork to clone    (default: https://github.com/djmbdv/vscode)
-#   MS_COMMIT          commit to build  (default: 1.135.0 pinned in codibun)
+#   MS_COMMIT          commit to build  (default: 1.135.0 pinned in codebun)
 #   WORK               build dir        (default: .work)
 #   DEST               output dir       (default: web/public)
 #   IGNORE_SCRIPTS     "1" (default) to skip native postinstalls (kerberos, ...)

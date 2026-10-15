@@ -127,12 +127,12 @@ above.
 
 ## 4. Why `vscode` is NOT a submodule here
 
-`codibun/get_repo.sh` clones by SHA and `dev/patch.sh` runs `git reset --hard`, so the
+`codebun/get_repo.sh` clones by SHA and `dev/patch.sh` runs `git reset --hard`, so the
 vscode tree is **mutable and regenerable**. A submodule is for *pinning a tree you
 edit*. Here we only **consume** vscode as a *build input* (to build `vscode-web`), so a
 disposable clone in `.work/` is the right call.
 
-If `vshell` ever needs to **patch** vscode, that changes: submodule (or codibun's
+If `vshell` ever needs to **patch** vscode, that changes: submodule (or codebun's
 `patches/` pipeline).
 
 ## 5. JS ↔ V bridge

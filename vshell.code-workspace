@@ -8,7 +8,7 @@
   "folders": [
     {
       // The VS Code / VSCodium fork (build inputs, patches, configuration).
-      "name": "codibun (vscode fork)",
+      "name": "codebun (vscode fork)",
       "path": ".."
     },
     {

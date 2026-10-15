@@ -193,7 +193,7 @@ can run Node code.
       backend extension) + assets. `vscode-reh-web` joins the bundle **only** if
       Phase 2b ends up being adopted.
 - [ ] Installers (MSI), signing, notarization.
-- [ ] Windows CI (GitHub Actions), reusing ideas from `codibun/.github`.
+- [ ] Windows CI (GitHub Actions), reusing ideas from `codebun/.github`.
 
 ---
 

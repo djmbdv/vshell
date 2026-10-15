@@ -268,7 +268,7 @@ GitHub Copilot Chat itself.
 
 ```bash
 # web bundle (uses Git's bash: MSYS2 bash has no git on PATH)
-& 'C:\Program Files\Git\bin\bash.exe' -lc 'cd /c/Users/Lenovo/codibun/vshell && VSHELL_FAST=1 bash scripts/build_web.sh'
+& 'C:\Program Files\Git\bin\bash.exe' -lc 'cd /c/Users/Lenovo/codebun/vshell && VSHELL_FAST=1 bash scripts/build_web.sh'
 # add VSHELL_MINIFY=1 for the minified bundle
 
 # WebKit, from an ELEVATED shell
