@@ -18,5 +18,9 @@ foreach ($t in $tools) {
 
 Write-Host ''
 Write-Host 'Manual steps that cannot be automated:'
-Write-Host '  - Ultralight SDK download (license acceptance): https://ultralig.ht/download'
+Write-Host '  - WebKit (WinCairo) engine, built once outside this repo:'
+Write-Host '      perl Tools/Scripts/build-webkit --release     (in a WebKit/WebKit checkout)'
+Write-Host '      WK_SRC=... WK_BUILD=... sh scripts/stage_runtime.sh'
+Write-Host '    build_vshell.sh runs that staging for you the first time.'
+Write-Host '  - (legacy backend only) Ultralight SDK: https://ultralig.ht/download'
 Write-Host '  - vscode-web build: sh scripts/build_web.sh'

@@ -8,6 +8,8 @@
 
 import { join } from 'node:path'
 
+import { handleBackend } from './backend.js'
+
 const argv = process.argv.slice(2)
 const opt = (name, def) => {
   const i = argv.indexOf(`--${name}`)
@@ -114,6 +116,12 @@ const server = Bun.serve({
     // `new URL(<base>, origin) + '/out/'`, which yields '//out/...'.
     const pathname = decodeURIComponent(url.pathname).replace(/\/{2,}/g, '/')
     if (accessLog) console.log(`vshell-web: ${req.method} ${pathname}`)
+
+    // The Codebun backend (filesystem for now, terminal and search later).
+    // Mounted before the static handling so no file named like a route can
+    // shadow it. See web/backend.js.
+    const backend = await handleBackend(req, pathname)
+    if (backend) return backend
 
     // The workbench host page (a rendered template, not a static file).
     if (pathname === '/' || pathname === '/index.html') {

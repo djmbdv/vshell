@@ -350,6 +350,13 @@ pub fn (mut e UltralightEngine) start_remote_inspector(port int) bool {
 	return C.ulStartRemoteInspectorServer(r, c'127.0.0.1', u16(port))
 }
 
+// show_inspector keeps the Engine interface satisfied. Ultralight Free has no
+// usable inspector, so this is always false; the WebKit backend implements it
+// for real (WKInspectorShow).
+pub fn (mut e UltralightEngine) show_inspector(attached bool) bool {
+	return false
+}
+
 fn (e UltralightEngine) eval_raw(script string) !string {
 	if e.view == unsafe { nil } {
 		return error('no view: call create_window() first')

@@ -5,7 +5,7 @@
 #
 # Anything that is not --rebuild is forwarded to vshell.exe. With no arguments it
 # supplies the defaults the shell needs to find the web build:
-#   --engine ultralight --port 8123 --web-root web/public
+#   --engine webkit --port 8123 --web-root web/public
 #
 # Must run from the project root (it cd's there itself): main.v resolves
 # web/serve.js and web/public relative to the working directory.
@@ -59,7 +59,7 @@ fi
 
 # --- run ---------------------------------------------------------------------
 if [ "${#args[@]}" -eq 0 ]; then
-	args=(--engine ultralight --port 8123 --web-root web/public)
+	args=(--engine webkit --port 8123 --web-root web/public)
 fi
 
 echo "==> vshell ${args[*]}"

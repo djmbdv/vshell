@@ -1,0 +1,44 @@
+diff --git a/Source/WebKit/GPUProcess/GPUProcess.cpp b/Source/WebKit/GPUProcess/GPUProcess.cpp
+index 4b1be545fb..b182d73a5d 100644
+--- a/Source/WebKit/GPUProcess/GPUProcess.cpp
++++ b/Source/WebKit/GPUProcess/GPUProcess.cpp
+@@ -490,6 +490,12 @@ void GPUProcess::recomputeNowPlayingOwner()
+             seatedConnection->becomeRemoteCommandFallbackTarget();
+     }
+ 
++#if ENABLE(VIDEO) || ENABLE(WEB_AUDIO)
++    // vshell: these two locals must stay ABOVE the assignments below, not inside
++    // the block that uses them. previousOwnerPage reads the pre-assignment value
++    // of m_activeNowPlayingOwner on purpose, so moving the computation down to
++    // where it is compared would make the comparison always false and silently
++    // stop notifying the UI process of NowPlaying election changes.
+     auto ownerPage = [&]() -> std::optional<QualifiedPageIdentifier> {
+         if (!eligibleOwner)
+             return std::nullopt;
+@@ -500,14 +506,26 @@ void GPUProcess::recomputeNowPlayingOwner()
+             return std::nullopt;
+         return QualifiedPageIdentifier { m_activeNowPlayingOwner->page, m_activeNowPlayingOwner->process };
+     }();
++#endif
+ 
+     m_activeNowPlayingOwner = eligibleOwner;
+     m_remoteCommandTarget = commandTarget;
+ 
++#if ENABLE(VIDEO) || ENABLE(WEB_AUDIO)
++    // vshell: the message sent below is declared in
++    // UIProcess/GPU/GPUProcessProxy.messages.in under exactly this condition
++    //     #if ENABLE(VIDEO) || ENABLE(WEB_AUDIO)
++    // so it is not generated when both are off, yet this call site is unguarded:
++    //   GPUProcess.cpp(510): error: no member named 'NowPlayingOwnerDidChange'
++    //                        in namespace 'Messages::GPUProcessProxy'
++    // WinCairo already ships ENABLE_WEB_AUDIO=OFF, so disabling ENABLE_VIDEO alone
++    // reaches this state.
++    //
+     // The UI process owns the per-page "is the NowPlaying session" state, so it hears the election result
+     // directly rather than through the content processes, none of which can see the whole picture.
+     if (ownerPage != previousOwnerPage)
+         protect(parentProcessConnection())->send(Messages::GPUProcessProxy::NowPlayingOwnerDidChange(ownerPage), 0);
++#endif
+ }
+ 
+ void GPUProcess::setNowPlayingFallbackSession(std::optional<WebCore::QualifiedMediaSessionIdentifier> session)

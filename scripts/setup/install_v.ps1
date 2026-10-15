@@ -38,5 +38,6 @@ Write-Host ""
 Write-Host "V installed at: $root"
 Write-Host "Restart the shell so the new PATH is loaded, then run: v version"
 Write-Host ""
-Write-Host "Then build the shell, e.g.:"
-Write-Host '    v -cc gcc -cflags "-I<ultralight-sdk>\include" -ldflags "-L<ultralight-sdk>\lib -lUltralight -lUltralightCore -lWebCore -lAppCore" -o vshell .'
+Write-Host "Then build the shell with the repo scripts (they stage the engine too):"
+Write-Host '    sh scripts/build_vshell.sh --run'
+Write-Host '    # needs the WebKit/WinCairo engine staged in .work/wk (see the README)'

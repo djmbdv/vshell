@@ -1,0 +1,56 @@
+# `codebun-backend`
+
+The workbench side of the Codebun backend: file system, and later terminal and
+search. It is an ordinary **web extension**, with three requirements that are not
+optional in this build:
+
+| piece | why |
+| --- | --- |
+| `"browser": "./dist/browser/extension"` in `package.json` | without it the web extension host treats the extension as desktop-only and never activates it |
+| `esbuild.browser.mts` | `build/lib/extensions.ts` looks for **exactly** this name for the web target, and the fallback to `.esbuild.mts` is disabled for web (`if (!hasEsbuild && !forWeb)`) |
+| `tsconfig.browser.json` | the web typecheck step uses it; it extends `tsconfig.json` |
+
+It also has to be a **direct child of `extensions/`**, because
+`esbuild.browser.mts` imports `../esbuild-extension-common.mts`.
+
+## Two traps that cost real time here
+
+**The folder must not be opened through the URL.** `vscode.openFolder` reloads the
+page with `?folder=<uri>`, and the workbench resolves that folder *before* the web
+extension host has started, so the provider is missing every time: it logs "Unable to
+resolve filesystem provider", discards the folder, reloads again, and the page ends
+up blank. The folder is added to the running window with `updateWorkspaceFolders`
+instead. Measured details and the reasoning are in `docs/ARCHITECTURE.md` §3.2.
+
+**`fetch` needs an absolute URL.** The extension host runs in a Web Worker
+(`WorkerGlobalScope`), where a relative path such as `/codebun/backend/hello` has
+nothing to resolve against and fails with "Failed to parse URL". The base comes from
+the worker's own `location.origin`.
+
+## Where the source lives, and why it is copied
+
+The source is kept **here**, in the shell repo, and `scripts/lib/configure_vscode_for_bun.sh`
+copies it into the checkout on every configure. The checkout is disposable —
+`fetch_vscode_web.sh` runs `git reset --hard` — so anything written directly there
+disappears on the next build. Copying it in on each configure is what makes the two
+survive each other.
+
+## Why this extension exists at all
+
+The VS Code **web** build has no access to the real file system and no terminal.
+`web/serve.js` only serves static files and renders the host page template, so
+"open folder" cannot work without a backend. The desktop build gets this from
+Electron; the web build gets it from a server (`vscode-reh-web`) or from a web
+extension like this one. See `docs/ARCHITECTURE.md` §3.1 for the trade-off: this
+route keeps everything on Bun but only runs **web** extensions, so Python, C++ or
+ESLint (Node extensions) stay out until Phase 2b.
+
+## Security
+
+The Bun service listens on `127.0.0.1` and only checks that a request which *sends*
+an `Origin` sends the right one. That is a coarse filter against a stray web page and
+nothing more: any local process can forge the header, and a browser omits `Origin`
+entirely on same-origin GETs (which is why requiring it — the first version — broke
+the editor's own reads). A token is the intended design and is **not implemented
+yet**; it must arrive before anything destructive is added. Do not treat the current
+check as isolation.

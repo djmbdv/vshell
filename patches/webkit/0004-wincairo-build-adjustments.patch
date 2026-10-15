@@ -1,0 +1,146 @@
+diff --git a/Source/ThirdParty/skia/CMakeLists.txt b/Source/ThirdParty/skia/CMakeLists.txt
+index 679b31f339..ba26932cbf 100644
+--- a/Source/ThirdParty/skia/CMakeLists.txt
++++ b/Source/ThirdParty/skia/CMakeLists.txt
+@@ -1004,19 +1004,50 @@ target_include_directories(Skia
+         "${Skia_FRAMEWORK_HEADERS_DIR}/mod"
+ )
+ 
+-file(MAKE_DIRECTORY "${Skia_FRAMEWORK_HEADERS_DIR}/top")
+-file(CREATE_LINK
+-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+-    "${Skia_FRAMEWORK_HEADERS_DIR}/top/skia"
+-    SYMBOLIC
+-)
++# Stage Skia's headers under a "skia/" prefix.
++#
++# Upstream uses symbolic links. On Windows those need the
++# SeCreateSymbolicLinkPrivilege, which is held only by elevated processes or
++# with Developer Mode enabled. Stage with per-file hard links instead: they need
++# no privilege and, unlike a copy, they share the file identity, so a header
++# reached both through the source tree and through the staged tree is still
++# de-duplicated by #pragma once. Hard links are also not reparse points, so
++# nothing that walks or deletes the build tree can follow one back into the
++# source tree.
++#
++# LOCAL PATCH: staging only happens on reconfigure, so after touching a header
++# under include/ or modules/svg/include/ remove WebKitBuild/<CONFIG>/Skia and
++# reconfigure.
++if (WIN32)
++    function(_skia_stage_headers source_dir destination_dir)
++        file(GLOB_RECURSE _headers RELATIVE "${source_dir}" "${source_dir}/*")
++        foreach (_header IN LISTS _headers)
++            set(_destination "${destination_dir}/${_header}")
++            get_filename_component(_destination_dir "${_destination}" DIRECTORY)
++            file(MAKE_DIRECTORY "${_destination_dir}")
++            file(CREATE_LINK "${source_dir}/${_header}" "${_destination}" COPY_ON_ERROR)
++        endforeach ()
++    endfunction()
++
++    _skia_stage_headers("${CMAKE_CURRENT_SOURCE_DIR}/include"
++        "${Skia_FRAMEWORK_HEADERS_DIR}/top/skia")
++    _skia_stage_headers("${CMAKE_CURRENT_SOURCE_DIR}/modules/svg/include"
++        "${Skia_FRAMEWORK_HEADERS_DIR}/mod/skia/modules/svg")
++else ()
++    file(MAKE_DIRECTORY "${Skia_FRAMEWORK_HEADERS_DIR}/top")
++    file(CREATE_LINK
++        "${CMAKE_CURRENT_SOURCE_DIR}/include"
++        "${Skia_FRAMEWORK_HEADERS_DIR}/top/skia"
++        SYMBOLIC
++    )
+ 
+-file(MAKE_DIRECTORY "${Skia_FRAMEWORK_HEADERS_DIR}/mod/skia/modules")
+-file(CREATE_LINK
+-    "${CMAKE_CURRENT_SOURCE_DIR}/modules/svg/include"
+-    "${Skia_FRAMEWORK_HEADERS_DIR}/mod/skia/modules/svg"
+-    SYMBOLIC
+-)
++    file(MAKE_DIRECTORY "${Skia_FRAMEWORK_HEADERS_DIR}/mod/skia/modules")
++    file(CREATE_LINK
++        "${CMAKE_CURRENT_SOURCE_DIR}/modules/svg/include"
++        "${Skia_FRAMEWORK_HEADERS_DIR}/mod/skia/modules/svg"
++        SYMBOLIC
++    )
++endif ()
+ 
+ target_compile_definitions(Skia PRIVATE
+     SKIA_IMPLEMENTATION=1
+diff --git a/Source/WebCore/WebCoreMacros.cmake b/Source/WebCore/WebCoreMacros.cmake
+index a6fbf4f8bd..a0fb68c849 100644
+--- a/Source/WebCore/WebCoreMacros.cmake
++++ b/Source/WebCore/WebCoreMacros.cmake
+@@ -102,23 +102,33 @@ function(GENERATE_BINDINGS target)
+         list(APPEND _abs_included_files ${f})
+     endforeach ()
+ 
++    # NOTE (Windows): file(WRITE) opens the file in text mode, so every embedded
++    # "\n" is translated to "\r\n". The bindings scripts read these lists with a
++    # bare chomp(), which strips only "\n", so each path keeps a trailing CR and
++    # the dictionary name/file lookup built from it misses:
++    #   Could NOT find IDL file for interface "EventTarget"
++    #   Unable to find definition for dictionary named 'EventInit'
++    # (generate-bindings-all.pl strips "\r" itself with s/\r?\n?$//r, but
++    # CodeGenerator.pm::IDLFileForInterface and
++    # combine-inspector-native-function-parameters.pl do not.)
++    # file(GENERATE) with NEWLINE_STYLE LF writes LF regardless of platform.
+     set(content)
+     foreach (f ${_abs_input_files} ${_abs_supplemental_files})
+         set(content "${content}${f}\n")
+     endforeach ()
+-    file(WRITE ${idl_files_list} ${content})
++    file(GENERATE OUTPUT ${idl_files_list} CONTENT "${content}" NEWLINE_STYLE LF)
+ 
+     set(pp_content)
+     foreach (f ${_abs_pp_input_files})
+         set(pp_content "${pp_content}${f}\n")
+     endforeach ()
+-    file(WRITE ${pp_idl_files_list} ${pp_content})
++    file(GENERATE OUTPUT ${pp_idl_files_list} CONTENT "${pp_content}" NEWLINE_STYLE LF)
+ 
+     set(include_content)
+     foreach (f ${_abs_input_files} ${_abs_supplemental_files} ${_abs_included_files})
+         set(include_content "${include_content}${f}\n")
+     endforeach ()
+-    file(WRITE ${included_idl_files_list} ${include_content})
++    file(GENERATE OUTPUT ${included_idl_files_list} CONTENT "${include_content}" NEWLINE_STYLE LF)
+ 
+     set(args
+         --defines ${arg_FEATURES}
+diff --git a/Source/cmake/WebKitMacros.cmake b/Source/cmake/WebKitMacros.cmake
+index 7a25024e76..3a5d229bea 100644
+--- a/Source/cmake/WebKitMacros.cmake
++++ b/Source/cmake/WebKitMacros.cmake
+@@ -1032,6 +1032,14 @@ function(WEBKIT_SYMLINK_FILES target_name)
+             file(MAKE_DIRECTORY ${opt_DESTINATION}/${file_dir})
+             set(dst_file ${opt_DESTINATION}/${file})
+         endif ()
++        # These MUST be symbolic links. A copy or a hard link will NOT do:
++        # clang-cl resolves #pragma once by canonical path, not by file identity,
++        # so a header reached both through the source tree and through this
++        # staged tree gets compiled twice and reports "redefinition of ...".
++        # Only a real symlink makes the second path canonicalize to the first.
++        # (Measured, not assumed: swapping this for create_hardlink keeps the
++        # redefinitions.) On Windows that means the build needs the
++        # SeCreateSymbolicLinkPrivilege: Developer Mode, or an elevated shell.
+         add_custom_command(OUTPUT ${dst_file}
+             COMMAND ${CMAKE_COMMAND} -E create_symlink ${src_file} ${dst_file}
+             MAIN_DEPENDENCY ${src_file}
+diff --git a/Tools/Scripts/rewrite-compile-commands b/Tools/Scripts/rewrite-compile-commands
+index b760bd026a..6f0e457c92 100755
+--- a/Tools/Scripts/rewrite-compile-commands
++++ b/Tools/Scripts/rewrite-compile-commands
+@@ -78,7 +78,13 @@ for entry in compile_commands:
+     # And Windows too:
+     # - WebKit\WebKitBuild\Release\WebCore\DerivedSources\unified-sources\UnifiedSource-42f7b70e-5.cpp
+     # So we extract the parent folders to map them to the source folders.
+-    parent_dir_1, parent_dir_2 = entry_file.rsplit(os.path.sep, maxsplit=4)[1:3]
++    # CMake always writes forward slashes in compile_commands.json, even on
++    # Windows, whereas the path styles documented above include backslashes.
++    # Splitting on os.path.sep alone finds no separator in a forward-slash path,
++    # so the slice below comes back empty and the unpack fails with
++    # "not enough values to unpack (expected 2, got 0)".
++    entry_path = entry_file.replace('\\', '/')
++    parent_dir_1, parent_dir_2 = entry_path.rsplit('/', maxsplit=4)[1:3]
+     search_directories = [
+         os.path.join(build_dir, parent_dir_1, parent_dir_2),
+     ]

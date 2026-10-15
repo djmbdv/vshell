@@ -56,7 +56,7 @@ SCRIPT_DIR="$( cd "$(dirname "${BASH_SOURCE[0]}")" && pwd )"
 # copilot, ipynb (excluded from the build outright, see
 # configure_vscode_for_bun.sh), the component-explorer (rspack/vite) and the
 # non-web extensions.
-DEFAULT_INSTALL_DIRS='build,extensions,extensions/configuration-editing,extensions/css-language-features,extensions/css-language-features/server,extensions/emmet,extensions/extension-editing,extensions/git-base,extensions/github-authentication,extensions/html-language-features,extensions/html-language-features/server,extensions/json-language-features,extensions/json-language-features/server,extensions/markdown-language-features,extensions/markdown-math,extensions/media-preview,extensions/merge-conflict,extensions/mermaid-markdown-features,extensions/npm,extensions/references-view,extensions/search-result,extensions/simple-browser,extensions/typescript-language-features'
+DEFAULT_INSTALL_DIRS='build,extensions,extensions/configuration-editing,extensions/css-language-features,extensions/css-language-features/server,extensions/emmet,extensions/extension-editing,extensions/git-base,extensions/github-authentication,extensions/html-language-features,extensions/html-language-features/server,extensions/json-language-features,extensions/json-language-features/server,extensions/markdown-language-features,extensions/markdown-math,extensions/media-preview,extensions/merge-conflict,extensions/npm,extensions/references-view,extensions/search-result,extensions/simple-browser,extensions/typescript-language-features'
 VSCODE_INSTALL_DIRS="${VSCODE_INSTALL_DIRS:-${DEFAULT_INSTALL_DIRS}}"
 
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }

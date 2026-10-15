@@ -10,8 +10,12 @@ terminal and see the test extension — all from `vshell.exe`.
 
 ## Phase 0 — Risk probe (1-2 days) ⬅ *start here*
 
-**Question to answer:** does the VS Code web workbench run correctly on Ultralight's
-WebKit fork?
+> **Historical record.** Phases 0 and 1 were done with the Ultralight backend, which
+> **Phase 1b** then replaced. They are kept because the page-level findings still
+> hold (vscode-web boots, 18 requests, 0 404s); what changed is the engine.
+
+**Question to answer:** does the VS Code web workbench run correctly inside an
+embedded WebKit?
 
 - [x] `scripts/lib/fetch_vscode_web.sh` produces `web/public` with `vscode-web`.
 - [x] The Bun server serves the assets (`bun run web/serve.js`).
@@ -24,7 +28,7 @@ opens the Ultralight window against the Bun server), not with the Browser sample
 
 ---
 
-## Phase 1 — Ultralight binding in V (1-2 weeks)
+## Phase 1 — Ultralight binding in V (1-2 weeks) ✅ *done; kept as the legacy backend*
 
 - [x] Install V (`scripts/setup/install_v.ps1`).
 - [x] Copy the real signatures from `AppCore/CAPI.h` and `Ultralight/CAPI/*.h` into `engine/ultralight.v`.
@@ -68,15 +72,97 @@ opens the Ultralight window against the Bun server), not with the Browser sample
 
 ---
 
-## Phase 2 — Bun server on the vscode fork (2-6 weeks) ⚠ high risk
+## Phase 1b — WebKit (WinCairo) backend — *the engine we ship*
+
+Decided after Phase 1: Ultralight is a beta **fork** with a commercial-only complete
+source and no usable DevTools in the Free edition. The upstream **WinCairo** port of
+WebKit gives the same JavaScriptCore family with LGPL/BSD terms and a real Web
+Inspector. Background: `docs/ARCHITECTURE.md` §2 and §5.
+
+- [x] Confirm the embedding API exists: `UIProcess/API/C/win/WKView.h`
+      (`WKViewCreate(RECT, WKPageConfigurationRef, HWND)`). Verified against `main`.
+- [x] `engine/webkit.v` + `engine/wk_host.h` behind the **same** `Engine` interface:
+      window, `load_url`, async `eval_js`, JS↔V bridge, `show_inspector()`.
+- [x] `scripts/stage_runtime.sh`: headers + MinGW import library + runtime, with a
+      nine-symbol probe (`WKViewCreate`, `WKPageEvaluateJavaScriptInMainFrame`, …).
+- [x] `scripts/build_vshell.sh` stages the engine on demand and checks that
+      `WebKit2.dll` + `WebKitWebProcess.exe` + `WebKitNetworkProcess.exe` land in
+      `bin/`.
+- [x] Checks: `v -check .` passes (interface conformance included) and the C glue
+      compiles (`gcc -fsyntax-only` against minimal stubs of the WebKit headers).
+      ⚠️ **This turned out to prove far less than it looked.** Against the *real*
+      headers three interop bugs appeared at once that stubs could not show:
+      `WKGetTypeID`/`WKRelease`/`WKRetain` live in `WKType.h`, not `WKBase.h`; the
+      generic getter is `WKGetTypeID(ref)` and `WKTypeGetTypeID` does not exist;
+      and `WKBaseWin.h` does an unguarded `typedef int pid_t;` that collides with
+      mingw-w64's `long long pid_t` (reached via libgc). Stubs authored by the same
+      hand as the glue can only confirm the assumptions of that hand.
+- [x] **Built the engine** (`build-webkit --release`): `WebKit2.dll` (17.9 MB),
+      `WebCore.dll` (56 MB), `MiniBrowser.exe` and the three helper processes.
+      They land in `WebKitBuild/Release/bin` — **not** `bin64`, which is what
+      docs.webkit.org states and what `stage_runtime.sh` first assumed.
+- [x] **Linked vshell against it** and got the workbench to load. The link needed
+      `#flag -lWebKit2` in `engine/webkit.v`: `WK_EXPORT` expands to
+      `__declspec(dllimport)`, so without it every API call fails with
+      `undefined reference to __imp_WKRelease` — confusing, because `WKRelease` *is*
+      present in the import library.
+- [x] Retired `engine/ultralight.v` and its branch in `new_engine()`. Done as
+      `ultralight.v.disabled` rather than `git rm`, matching the existing
+      `system_webview.v.disabled` convention, so it stays one `mv` away.
+- [ ] Resize/DPI, title/URL push events (`WKPageSetPageNavigationClient`), menus.
+
+**Acceptance:** ✅ met. `sh scripts/run.sh` opens the workbench in our own Win32
+window with the WebKit engine, and the two probes answer on stdout:
+
+```
+vshell: eval -> Welcome - Code - OSS     # WebKit loaded the page and ran JS
+vshell: eval -> vshell-bridge-wk         # the WKUserScript bridge is injected
+```
+
+---
+
+## Phase 2 — Our own backend: web extension + Bun service (2-4 weeks)
+
+What the web build cannot do on its own, and what `web/serve.js` does not provide
+today (it only serves static files and renders the host page template):
+
+- [ ] `FileSystemProvider` for a `codebun://` scheme mapped to real paths.
+- [ ] `Pseudoterminal` backed by **`bun-pty`** (`sursaone/bun-pty`) instead of
+      `node-pty`. Verify first that it works on Windows/ConPTY under Bun; if it does
+      not, fall back to a small ConPTY helper.
+- [ ] Workspace search.
+- [ ] A Bun service over HTTP/WS, with the connection token generated by the shell
+      and injected into the URL. **Define the security model together with the
+      handshake**: a token-guarded local port is reachable by any local process.
+- [ ] A folder dialog, because the web build's "Open Folder" does not use the native
+      one. This is the **first** vshell API function needed, ahead of menus.
+- [ ] Persist the last folder and add it back after activation, so a reload does not
+      lose it. It must **not** go back into the URL: that is the reload path that
+      cannot register the provider in time (`docs/ARCHITECTURE.md` §3.2).
+
+**Acceptance:** open a folder, edit and save a file, and run a command in the
+integrated terminal — from `vshell.exe`.
+
+**Deliberately out of scope:** Node-based extensions. Only web extensions can run in
+this route; that is the trade-off, and Phase 2b exists because of it.
+
+---
+
+## Phase 2b — `vscode-reh-web` on Bun (case by case) ⚠ high risk
+
+Only if the web-extension route proves too narrow. The deciding factor is the
+**extension ecosystem**: Python, C++, ESLint and friends need an extension host that
+can run Node code.
 
 - [ ] Build `vscode-reh-web-<plat>-<arch>` alongside `vscode-web`.
 - [ ] Start the REH with **Bun** (not Node) and verify the web ↔ reh handshake.
-- [ ] Inventory the natives and their Bun (N-API) compatibility:
-      `node-pty`, `@vscode/ripgrep`, `spdlog`, native keytar, sqlite.
-- [ ] Plan B if Bun fails: embedded Node server; Bun only for tooling.
+- [ ] Inventory the natives against **Bun's N-API**: `@vscode/ripgrep`, `spdlog`,
+      keytar, sqlite. (`node-pty` is already replaced by `bun-pty` in Phase 2.)
+- [ ] Judge case by case whether it stays on Bun. **Plan B is an embedded Node
+      server, and activating it breaks "everything on Bun" — decide that
+      explicitly, never by drift.**
 
-**Acceptance:** integrated terminal, search and extension host work end-to-end.
+**Acceptance:** Node-based extensions activate and the terminal keeps working.
 
 ---
 
@@ -103,7 +189,9 @@ opens the Ultralight window against the Bun server), not with the Browser sample
 
 ## Phase 5 — Packaging and CI (continuous)
 
-- [ ] Bundle: `vshell.exe` + `bun.exe` + assets + `vscode-reh-web`.
+- [ ] Bundle: `vshell.exe` + `bun.exe` + the web build (which carries the `codebun`
+      backend extension) + assets. `vscode-reh-web` joins the bundle **only** if
+      Phase 2b ends up being adopted.
 - [ ] Installers (MSI), signing, notarization.
 - [ ] Windows CI (GitHub Actions), reusing ideas from `codibun/.github`.
 
@@ -113,8 +201,9 @@ opens the Ultralight window against the Bun server), not with the Browser sample
 
 | # | Risk | Mitigation |
 |---|---|---|
-| 1 | VS Code web does not work well on Ultralight's WebKit fork | Phase 0 detects it; fall back to CEF |
-| 2 | Ultralight licensing (part of WebCore is LGPL; full source is Enterprise) | Review price/terms **before** Phase 3 |
-| 3 | Natives incompatible with Bun | Plan B with Node |
-| 4 | Ultralight is *single-process*, with no multi-process sandbox | Document the security model |
-| 5 | Maintaining the C binding in V | Keep the binding isolated in `engine/` |
+| 1 | WinCairo is built with MSVC/clang-cl while we link with mingw-w64 gcc | Both target UCRT; the C API is `extern "C"` with undecorated names, and the import library is generated from the DLL. `stage_runtime.sh` probes the symbols before anything else. |
+| 2 | The engine is not an SDK: building WebKit takes hours and ~60 GB | Documented build path; `build_vshell.sh` stages automatically afterwards. Prebuilt artefacts for CI come in Phase 5. |
+| 3 | A missing WebKit2 helper DLL or `*Process.exe` gives a **blank page** and no error | `build_vshell.sh` checks the three required files in `bin/` and warns loudly. |
+| 4 | `eval_js` is asynchronous and re-entrant if called from a WebKit callback | Pump from `pump()`, never from a callback; 3 s timeout. |
+| 5 | Natives incompatible with Bun | `node-pty` is replaced by `bun-pty`; the rest is judged case by case. Plan B (embedded Node) **breaks "everything on Bun"**, so it is a deliberate decision, not a silent fallback |
+| 6 | Maintaining the C binding in V | Keep the binding isolated in `engine/` |

@@ -21,6 +21,11 @@
 #
 set -euo pipefail
 
+# The shell repo this script belongs to, resolved BEFORE the cd below so a
+# relative $0 cannot be re-interpreted against the checkout. Used to stage the
+# Codebun backend extension into the checkout (see the end of this file).
+SHELL_REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+
 VDIR="${1:-.work/vscode}"
 cd "${VDIR}" || { echo "no vscode checkout at '${VDIR}'" >&2; exit 1; }
 
@@ -195,6 +200,22 @@ patch('build/lib/extensions.ts', [
 \t{ script: 'markdown-language-features/esbuild.notebook.mts', tsconfig: 'markdown-language-features/notebook/tsconfig.json' },`],
 ]);
 
+// Mermaid: ~58 MB of the 265 MB web output (22%) in unminified bundles, and a
+// desktop shell for a code editor does not need diagram rendering inside the
+// markdown preview. Same two-step treatment as ipynb, for the same reason: the
+// media list below is *static* and is NOT covered by excludedExtensions, so
+// removing the name alone would leave esbuild still trying to build it.
+patch('build/lib/extensions.ts', [
+  [`\t'copilot',
+\t'ipynb',`,
+   `\t'copilot',
+\t'ipynb',
+\t'mermaid-markdown-features',`],
+
+  [`\t{ script: 'mermaid-markdown-features/esbuild.webview.mts', tsconfig: 'mermaid-markdown-features/preview-src/tsconfig.json' },`,
+   `\t// vshell: mermaid-markdown-features excluded (see excludedExtensions above)`],
+]);
+
 // NLS (i18n) is the single most expensive step of the web bundle: it walks
 // ~1.7k modules and extracts ~21k messages, single-threaded (~5 min). A local
 // shell does not need translations, so it is OFF unless VSHELL_NLS=1 is set;
@@ -275,7 +296,74 @@ patch('build/next/index.ts', [
     console.log(`  ok (already configured): ${file}`);
   }
 }
+
+// Extension gallery: Open VSX, not the Microsoft marketplace.
+//
+// Without an `extensionsGallery`, build/lib/builtInExtensions.ts falls back to
+// downloading built-in extensions from GitHub releases (which is why the OSS
+// product.json only lists the three js-debug ones), and the workbench has no
+// marketplace at all: no extension can be installed from the UI.
+//
+// Open VSX is the documented, licence-clean option (it is what VSCodium ships).
+// The Microsoft marketplace is deliberately NOT used: it is the only source of
+// GitHub Copilot Chat, but its terms restrict distribution to Visual Studio
+// products, so a fork has no right to it. See docs/perf-trim.md.
+//
+// The values below are taken from VSCodium's prepare_vscode.sh rather than
+// invented, and `linkProtectionTrustedDomains` must include the host or the
+// workbench treats gallery links as untrusted.
+{
+  const file = 'product.json';
+  const pj = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const GALLERY = {
+    serviceUrl: 'https://open-vsx.org/vscode/gallery',
+    itemUrl: 'https://open-vsx.org/vscode/item',
+    latestUrlTemplate: 'https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest',
+    controlUrl: 'https://raw.githubusercontent.com/EclipseFdn/publish-extensions/refs/heads/master/extension-control/extensions.json',
+  };
+  let changed = false;
+  if (!pj.extensionsGallery) {
+    pj.extensionsGallery = GALLERY;
+    changed = true;
+  }
+  const domains = Array.isArray(pj.linkProtectionTrustedDomains) ? pj.linkProtectionTrustedDomains : [];
+  if (!domains.includes('https://open-vsx.org')) {
+    pj.linkProtectionTrustedDomains = [...domains, 'https://open-vsx.org'];
+    changed = true;
+  }
+  if (changed) {
+    // Tabs, like the rest of the file, so the diff stays readable.
+    fs.writeFileSync(file, JSON.stringify(pj, null, '\t') + '\n');
+    console.log(`  patched ${file} (open-vsx gallery)`);
+  } else {
+    console.log(`  ok (already configured): ${file}`);
+  }
+}
 BUNPATCH
 
 echo "==> configuring VS Code checkout for bun (${VDIR})"
 bun "${PATCHER}"
+
+# --- Codebun backend extension -----------------------------------------------
+#
+# The source lives in the shell repo, NOT in the checkout: the checkout is
+# disposable (fetch_vscode_web.sh runs `git reset --hard`), so anything written
+# there is lost on the next build. Copying it in on every configure is what makes
+# the two survive each other — the same reason every other edit in this file is a
+# patch rather than a commit.
+#
+# It has to land as a DIRECT child of extensions/, because its
+# esbuild.browser.mts imports `../esbuild-extension-common.mts` and that path only
+# resolves from that level. Background: extensions/codebun-backend/README.md.
+#
+# Without this the web build still succeeds — it simply has no backend, and the
+# workbench cannot open a folder. That silence is why the check below is loud.
+CB_SRC="${VSHELL_CODEBUN_EXT:-$SHELL_REPO/extensions/codebun-backend}"
+if [ -d "$CB_SRC" ]; then
+	rm -rf extensions/codebun-backend
+	cp -r "$CB_SRC" extensions/codebun-backend
+	echo "  staged extensions/codebun-backend (the web backend extension)"
+else
+	echo "  ! codebun-backend not found at $CB_SRC" >&2
+	echo "    the web build will have no filesystem backend and cannot open a folder" >&2
+fi

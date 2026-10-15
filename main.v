@@ -12,8 +12,9 @@ import engine
 //   4. run the engine loop
 //   5. tear everything down on exit (including the Bun child)
 //
-// See ROADMAP.md. Phases 0/1 are validated: the workbench boots inside the
-// Ultralight (WebKit + JavaScriptCore) view.
+// See ROADMAP.md. Phases 0/1 were validated on the Ultralight backend, which
+// Phase 1b replaced: the workbench now boots inside WebKit (the WinCairo port),
+// same JavaScriptCore family, no V8 anywhere.
 
 const default_port = 8123
 const default_web_root = 'web/public'
@@ -21,7 +22,7 @@ const serve_script = 'web/serve.js'
 
 struct Options {
 mut:
-	engine_kind string = 'ultralight'
+	engine_kind string = 'webkit'
 	port        int    = default_port
 	web_root    string = default_web_root
 	dev_mode    bool
@@ -60,11 +61,14 @@ fn run() !int {
 	eng.create_window('vshell', url, 1280, 800, opts.dev_mode)!
 
 	if opts.dev_mode {
-		// Documented as unavailable in the Free edition; report it honestly.
+		// Ultralight Free has no remote inspector, and WebKit/WinCairo has no remote
+		// server either — but it does have the real Web Inspector.
 		if eng.start_remote_inspector(9222) {
 			println('vshell: remote inspector on inspector://127.0.0.1:9222')
+		} else if eng.show_inspector(false) {
+			println('vshell: Web Inspector opened in its own window')
 		} else {
-			println('vshell: remote inspector not available (Ultralight Free edition)')
+			println('vshell: no inspector available for this engine')
 		}
 	}
 

@@ -1,0 +1,33 @@
+diff --git a/Source/WebCore/page/text-extraction/TextExtraction.cpp b/Source/WebCore/page/text-extraction/TextExtraction.cpp
+index 70e0259221..201b9c571f 100644
+--- a/Source/WebCore/page/text-extraction/TextExtraction.cpp
++++ b/Source/WebCore/page/text-extraction/TextExtraction.cpp
+@@ -961,12 +961,28 @@ static inline Variant<SkipExtraction, ItemData, URL, Editable> extractItemData(N
+     if (is<HTMLCanvasElement>(element))
+         return { ItemData { ContainerType::Canvas } };
+ 
++    // NOTE: ENABLE(VIDEO) is required here, not just an optimisation.
++    //
++    // With ENABLE_VIDEO off, HTMLVideoElement.h takes its #else branch: it never
++    // includes HTMLMediaElement.h and defines HTMLVideoElement as a stub that does
++    // NOT derive from HTMLMediaElement. The is<HTMLVideoElement>() check below then
++    // fails to compile -- and it fails inside a WTF type trait, so the diagnostics
++    // are several layers away from this line:
++    //   TypeCasts.h(62): static assertion failed: "Unnecessary type check"
++    //   TypeCasts.h(46): static assertion failed: "Missing TypeCastTraits specialization"
++    //   type_traits(1387): incomplete type 'const WebCore::HTMLMediaElement' used in
++    //                      type trait expression
++    // This file had never been compiled in that configuration upstream. Guarding the
++    // block is correct rather than cosmetic: with video disabled there is no video
++    // media element to report.
++#if ENABLE(VIDEO)
+     if (RefPtr media = dynamicDowncast<HTMLMediaElement>(element)) {
+         return { MediaItemData {
+             .type = is<HTMLVideoElement>(*media) ? MediaType::Video : MediaType::Audio,
+             .hasControls = media->controls(),
+         } };
+     }
++#endif
+ 
+     if (CheckedPtr box = dynamicDowncast<RenderBox>(node.renderer()); box && box->canBeScrolledAndHasScrollableArea()) {
+         if (CheckedPtr layer = box->layer()) {

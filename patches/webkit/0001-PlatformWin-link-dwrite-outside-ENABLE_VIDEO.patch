@@ -1,0 +1,25 @@
+diff --git a/Source/WebCore/PlatformWin.cmake b/Source/WebCore/PlatformWin.cmake
+index 35ee5cbfdc..b103171592 100644
+--- a/Source/WebCore/PlatformWin.cmake
++++ b/Source/WebCore/PlatformWin.cmake
+@@ -148,8 +148,20 @@ list(APPEND WebCore_PRIVATE_FRAMEWORK_HEADERS
+     platform/win/WindowsKeyNames.h
+ )
+ 
++# vshell: dwrite belongs to this unconditional list, not only inside the
++# ENABLE_VIDEO block further down.
++#
++# The Skia font backend (platform/graphics/win/FontCacheSkiaWin.cpp) calls
++# DWriteCreateFactory() unconditionally, but upstream only links dwrite through
++# the MediaFoundation INTERFACE library, which does not exist when
++# ENABLE_VIDEO=OFF. That turns video-off into a LINK failure (the whole of WebCore
++# compiles fine, which makes it look unrelated):
++#   lld-link: error: undefined symbol: __declspec(dllimport) DWriteCreateFactory
++#   >>> referenced by platform\graphics\win\FontCacheSkiaWin.cpp:54
++# Linking an import library twice is harmless, so this is safe when video is on.
+ list(APPEND WebCore_LIBRARIES
+     crypt32
++    dwrite
+     iphlpapi
+     usp10
+     ws2_32

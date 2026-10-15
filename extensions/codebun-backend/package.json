@@ -1,0 +1,57 @@
+{
+	"name": "codebun-backend",
+	"displayName": "Codebun",
+	"description": "Folder, terminal and search backend for the Codebun shell. Talks to the Bun service the shell runs.",
+	"version": "0.0.1",
+	"publisher": "codebun",
+	"license": "MIT",
+	"engines": {
+		"vscode": "^1.90.0"
+	},
+	"main": "./out/extension",
+	"browser": "./dist/browser/extension",
+	"categories": [
+		"Other"
+	],
+	"extensionKind": [
+		"ui",
+		"workspace"
+	],
+	"activationEvents": [
+		"onFileSystem:codebun",
+		"onCommand:codebun.openFolder",
+		"onCommand:codebun.status"
+	],
+	"capabilities": {
+		"virtualWorkspaces": true,
+		"untrustedWorkspaces": {
+			"supported": true
+		}
+	},
+	"contributes": {
+		"commands": [
+			{
+				"command": "codebun.openFolder",
+				"title": "Open Folder...",
+				"category": "Codebun"
+			},
+			{
+				"command": "codebun.status",
+				"title": "Show Backend Status",
+				"category": "Codebun"
+			}
+		],
+		"menus": {
+			"commandPalette": [
+				{
+					"command": "codebun.openFolder",
+					"when": "isWeb"
+				},
+				{
+					"command": "codebun.status",
+					"when": "isWeb"
+				}
+			]
+		}
+	}
+}
