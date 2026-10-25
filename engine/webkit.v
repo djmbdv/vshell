@@ -613,8 +613,15 @@ pub fn (mut e WebKitEngine) run() ! {
 			break
 		}
 		e.pump()
-		// Wakes on any message, or after 8 ms so the bridge still ticks when idle.
-		C.wk_host_wait(e.host, 8)
+		// The wait wakes on any message; the timeout only matters when the page is
+		// silent. It has to be short while the shell itself has queued work — page
+		// not ready, CLI evals pending, or the title-poll fallback — and can be long
+		// otherwise: user input arrives as a Win32 message, which wakes
+		// MsgWaitForMultipleObjectsEx immediately, so a slow tick costs no
+		// responsiveness. Measured before this: 8 ms forever = 125 wakeups/s and
+		// ~4.5 % of a core on an idle window.
+		idle := !e.page_ready || e.pending.len > 0 || e.poll_title
+		C.wk_host_wait(e.host, if idle { 8 } else { 200 })
 	}
 }
 

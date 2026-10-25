@@ -113,6 +113,12 @@ sh scripts/run.sh -- --port 9000 --web-root web/public
 | `--folder <path>` | open that folder directly, no dialog |
 | `--url <url>` | load a server this process does **not** start (any static host). `--port`/`--web-root` are then ignored |
 | `--reh <url>` | load a `vscode-reh-web` **through the shell**: the Bun server becomes the origin and proxies to it, terminating the WebSocket itself (see *Remote extension host* below) |
+| `--reh-run <dir>` | start that `vscode-reh-web` yourself (`<dir>/out/server-main.js`, data in `<dir>/../reh-data`) and proxy to it. One command, and the whole tree — REH, extension host, pty host, file watchers — is owned by the shell: closing (or killing) it leaves nothing behind |
+| `--reh-port <n>` | port the REH listens on with `--reh-run` (default 8137) |
+| `--no-cache` | have the proxy answer `Cache-Control: no-store`. The REH marks `/static` with a one-year max-age and no validator, so WebKit happily keeps running the bundle you just rebuilt; use it together with a **different `--port`** to invalidate an entry that is already cached |
+
+`VSHELL_WS_DEBUG=1` prints a line every 200 WebSocket messages the proxy relays — the
+quickest way to tell "the workbench is busy" from "the shell is talking to itself".
 
 ### JS ↔ V bridge
 

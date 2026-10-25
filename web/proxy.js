@@ -38,6 +38,13 @@ const RESPONSE_DROP = [...REQUEST_HOP_BY_HOP, 'content-encoding', 'content-lengt
 
 const isUpgrade = (req) => (req.headers.get('upgrade') ?? '').toLowerCase() === 'websocket'
 
+// The client and the server talk over the tunnel this file terminates, so a message
+// flood shows up here and nowhere else: the access log only sees the upgrade, and the
+// proxy stays at 0 % CPU because forwarding is cheap. VSHELL_WS_DEBUG=1 prints a line
+// every 200 client messages — the quickest way to tell "the workbench is busy" from
+// "the shell is talking to itself".
+const DEBUG_WS = process.env.VSHELL_WS_DEBUG === '1'
+
 /** http(s) -> ws(s), keeping path and query. */
 export function upstreamSocketUrl(target) {
   const u = new URL(target)
@@ -67,6 +74,9 @@ export const proxyWebsocket = {
       ws.data.queue = []
     })
     up.addEventListener('message', (e) => {
+      if (DEBUG_WS) {
+        ws.data.downCount = (ws.data.downCount ?? 0) + 1
+      }
       try { ws.send(e.data) } catch { /* client gone */ }
     })
     up.addEventListener('close', (e) => {
@@ -80,6 +90,12 @@ export const proxyWebsocket = {
   },
 
   message(ws, msg) {
+    if (DEBUG_WS) {
+      ws.data.upCount = (ws.data.upCount ?? 0) + 1
+      if (ws.data.upCount % 200 === 0) {
+        console.log(`vshell-web: ws up=${ws.data.upCount} down=${ws.data.downCount}`)
+      }
+    }
     const up = ws.data.up
     if (up && up.readyState === WebSocket.OPEN) {
       try { up.send(msg) } catch { /* upstream gone */ }
@@ -99,7 +115,8 @@ export function handleProxyUpgrade(req, url, server, upstreamBase) {
     return new Response('server does not support websocket upgrades', { status: 500 })
   }
   const target = new URL(url.pathname + url.search, upstreamBase)
-  const ok = server.upgrade(req, { data: { upstreamUrl: upstreamSocketUrl(target.toString()), up: null, queue: [] } })
+  const data = { upstreamUrl: upstreamSocketUrl(target.toString()), up: null, queue: [] }
+  const ok = server.upgrade(req, { data })
   return ok ? UPGRADED : new Response('websocket upgrade failed', { status: 400 })
 }
 

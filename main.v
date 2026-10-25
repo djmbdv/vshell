@@ -45,6 +45,13 @@ mut:
 	// workbench the browser keeps running the old bundle and every change looks like
 	// it did nothing. Development flag; the default keeps the cache.
 	no_cache    bool
+	// reh_run is the directory of a built REH (the one `build_reh.sh` assembles).
+	// The shell starts it, proxies to it and — because the shell's job object holds
+	// the whole tree — takes the extension host, the pty host and the file watchers
+	// down with it when the window closes. This is what keeps repeated runs from
+	// leaving orphaned Bun processes behind.
+	reh_run  string
+	reh_port int = 8137
 	// evals are JS snippets run in the page once it is live (a way to poke the
 	// bridge from the CLI without any UI).
 	evals       []string
@@ -77,7 +84,7 @@ fn main() {
 }
 
 fn run() !int {
-	opts := parse_args(os.args)
+	mut opts := parse_args(os.args)
 
 	// The session token gates the Bun backend. The Bun child is spawned from this
 	// process (start_web_server), so it inherits the value through the
@@ -100,12 +107,33 @@ fn run() !int {
 	}
 
 	mut server := WebServer{}
+	mut reh_child := WebServer{}
 	if opts.url == '' {
+		// Before any child exists: the job has to be in place to contain them, and it
+		// is what guarantees nothing survives the shell (see proc_job.v).
+		if !process_job_init() {
+			eprintln('vshell: could not create the job object; children may outlive the shell')
+		}
+
+		// --reh-run: start the REH ourselves so the job object owns it too. Without
+		// this the REH is something the user starts by hand, and a killed server
+		// leaves its extension host, pty hosts and file watchers running.
+		if opts.reh_run != '' {
+			reh_child = start_reh(opts.reh_run, opts.reh_port)!
+			if !process_job_assign(reh_child.pid) {
+				eprintln('vshell: could not put the REH in the job object')
+			}
+			opts.reh = 'http://127.0.0.1:${opts.reh_port}/'
+		}
+
 		mut extra := if opts.reh != '' { ['--upstream', opts.reh] } else { []string{} }
 		if opts.no_cache {
 			extra << '--no-cache'
 		}
 		server = start_web_server(serve_script, opts.web_root, opts.port, extra)!
+		if !process_job_assign(server.pid) {
+			eprintln('vshell: could not put the web server in the job object')
+		}
 		println('vshell: web server pid=${server.pid} port=${server.port}')
 		if opts.reh != '' {
 			println('vshell: proxying to ${opts.reh}')
@@ -116,12 +144,20 @@ fn run() !int {
 		if !server.wait_until_listening(10_000) {
 			return error('the web server never started listening on port ${opts.port}')
 		}
+		// Same for the REH: serving the shell's page while the upstream is still
+		// binding would hand the client a 502 and a blank workbench.
+		if opts.reh_run != '' {
+			if !WebServer{ port: opts.reh_port }.wait_until_listening(30_000) {
+				return error('the REH never started listening on port ${opts.reh_port}')
+			}
+		}
 	} else {
 		// Nothing to wait for: --url means somebody else owns the server.
 		println('vshell: loading ${opts.url} (no server started)')
 	}
 	defer {
 		server.stop()
+		reh_child.stop()
 	}
 
 	mut eng := engine.new_engine(opts.engine_kind)!
@@ -163,6 +199,35 @@ fn run() !int {
 
 	println('vshell: bye')
 	return 0
+}
+
+// start_reh launches a built REH (`<dir>/out/server-main.js`) as a child of the
+// shell. It returns the process; the caller puts it in the job object, so the whole
+// tree — REH, extension host, pty host, file watchers — dies with the shell.
+//
+// The data directory follows what build_reh.sh assembles: the REH lives in
+// `<parent>/reh` and keeps its state in `<parent>/reh-data`, so a rebuilt layout
+// keeps its installed extensions and settings.
+fn start_reh(dir string, port int) !WebServer {
+	bun := find_executable('bun') or { return error('bun not found in PATH (needed to run the REH)') }
+	main_js := '${dir}/out/server-main.js'
+	if !os.exists(main_js) {
+		return error('no REH at ${main_js} (run scripts/build_reh.sh first)')
+	}
+	parent := os.dir(dir.trim_right('/\\'))
+	data := '${parent}/reh-data'
+	args := [
+		main_js,
+		'--port', port.str(),
+		'--host', '127.0.0.1',
+		'--without-connection-token',
+		'--accept-server-license-terms',
+		'--disable-telemetry',
+		'--user-data-dir', '${data}/data',
+		'--extensions-dir', '${data}/extensions',
+	]
+	println('vshell: starting REH ${main_js} on port ${port}')
+	return start_child(bun, args)
 }
 
 // build_menu is the shell's chrome, written in the shell's vocabulary: a label
@@ -283,6 +348,22 @@ fn parse_args(args []string) Options {	mut opts := Options{}
 			'--no-cache' {
 				opts.no_cache = true
 				i++
+			}
+			'--reh-run' {
+				if i + 1 < args.len {
+					opts.reh_run = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--reh-port' {
+				if i + 1 < args.len {
+					opts.reh_port = args[i + 1].int()
+					i += 2
+				} else {
+					i++
+				}
 			}
 			'--eval' {
 				// Take EVERY following token that is not another flag. On Windows the

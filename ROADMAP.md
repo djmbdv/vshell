@@ -290,6 +290,33 @@ pty host that is itself `bun.exe`.
 
 ---
 
+## Phase 2c — Performance (measured, not guessed)
+
+The first honest numbers, and what fixed them:
+
+| | before | after | why |
+|---|---|---|---|
+| bundle shipped to the client | 38 MB unminified | 19 MB | `bun build/next/index.ts bundle` is `--minify`-optional and we were not passing it |
+| workbench ready | 19-32 s of CPU before the page could even open its socket | 3.3-5 s | the WebKit web process was parsing twice the code |
+| boot RAM (web process) | ~700 MB | ~400-480 MB | same |
+| idle wakeups | 125/s (8 ms tick forever) | ~5/s, adaptive | the message loop now waits 200 ms unless the shell has queued work (page not ready, evals pending, title-poll fallback); input arrives as a message, so responsiveness is unaffected |
+| orphaned processes | 4 proxies + 4 file watchers ≈ 340 MB after a dozen runs | 0 | a **job object** with `KILL_ON_JOB_CLOSE`: one assignment on the child covers the whole tree, and it is what `--reh-run` uses to own the REH |
+
+Measured idle, workbench mounted, no folder open: shell 0.3 %, web 1.9 %, GPU 0.8 %,
+network 0.6 %.
+
+**Open, and the honest state of it:** with a folder open the idle cost jumps — 10-160 %
+of a core depending on the run, spread across a single hot thread of the web process
+(54 %, `Wait` state, i.e. a loop of short waits), the network process and the UI
+process. It is not a HTTP loop (0 requests in 10 s), not a WebSocket flood (fewer than
+200 messages), not CSS animation (`document.getAnimations()` empty), not `rAF` (2
+frames in 3.3 s) and not visibility (identical when minimised). `WEBKIT_DISABLE_
+COMPOSITING_MODE=1` happened to measure 10x lower once, which has not reproduced.
+Next step is a native profile (WPA/xperf) of that thread; guessing further without one
+is how the last few hours went.
+
+---
+
 ## Phase 3 — Shell (what the web build does NOT give you) (4-8 weeks)
 
 - [ ] Single instance.

@@ -50,6 +50,24 @@ pub fn (mut s WebServer) stop() {
 	s.p = unsafe { nil }
 }
 
+// start_child launches an arbitrary process the shell owns. It exists for
+// `--reh-run`: the REH is a second Bun server (and it in turn starts the
+// extension host, the pty host and file watchers), so having the shell start it
+// inside its job object is what makes "close the window, everything is gone"
+// true for the whole tree instead of only for the proxy.
+pub fn start_child(exe string, args []string) !WebServer {
+	mut p := os.new_process(exe)
+	p.set_args(args)
+	p.run()
+	if !p.is_alive() {
+		return error('failed to start ${exe}')
+	}
+	return WebServer{
+		p:   p
+		pid: p.pid
+	}
+}
+
 // wait_until_listening polls the TCP port so the window only loads once Bun is
 // accepting connections. Returns false if it never comes up within timeout_ms.
 pub fn (s WebServer) wait_until_listening(timeout_ms int) bool {

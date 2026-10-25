@@ -130,7 +130,16 @@ echo "==> bundling server-web (this reuses the checkout, ~1-2 min)"
 install_conpty_dlls
 (
 	cd "${VS}"
-	bun build/next/index.ts bundle --target server-web --out out-vscode-reh-web
+	# --minify is not cosmetic here: without it the client module is 38 MB of
+	# readable source, and the WebKit web process spends ~19 s of CPU (and ~700 MB
+	# of RAM) parsing and executing it before the workbench can even open its socket
+	# — the window sits empty for half a minute. Measured: 37989974 bytes unminified
+	# vs 19000000 minified, boot 32 s vs ~5 s.
+	#
+	# Deliberately NOT used: --mangle-privates (194 fields, ~33 s of extra build time
+	# and the bundle stays exactly the same size) and --exclude-tests (no measurable
+	# difference). They cost build time and buy nothing here.
+	bun build/next/index.ts bundle --target server-web --minify --out out-vscode-reh-web
 )
 
 echo "==> assembling ${REH}"
@@ -162,6 +171,16 @@ for link in node_modules extensions; do
 done
 
 mkdir -p "${DATA}"
+# The Codebun backend is a *web* extension: it talks to the Bun service the shell
+# starts, and only the web packaging stream compiles it. In a REH layout the stream
+# copies its sources but nothing builds them, so it is scanned, cannot load, and
+# still counts as a candidate for the browser extension host — pure weight and noise.
+if [ -d "${REH}/extensions/codebun-backend" ] \
+	&& [ ! -f "${REH}/extensions/codebun-backend/dist/browser/extension.js" ] \
+	&& [ ! -f "${REH}/extensions/codebun-backend/out/extension.js" ]; then
+	rm -rf "${REH}/extensions/codebun-backend"
+	echo "    dropped codebun-backend (web-only, no compiled entry for the REH)"
+fi
 echo "    layout: ${REH}"
 echo "    check : ${REH}/out/server-main.js $([ -f "${REH}/out/server-main.js" ] && echo present || echo MISSING)"
 
