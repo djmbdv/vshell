@@ -211,6 +211,16 @@ inside the engine's update callback deadlocks**.
   `''`, with no error. So a script whose value matters must return a string itself
   (`JSON.stringify(...)`, or a ternary — the readiness probe in `pump()` does exactly
   that).
+- **The eval callback never reports an exception.** `WKPageEvaluateJavaScriptInFrame`
+  ends with `if (result) callback(…, nullptr, …); else callback(nullptr, nullptr, …)`
+  (`Source/WebKit/UIProcess/API/C/WKPage.cpp`), so a thrown exception, a syntax error
+  and a cancelled evaluation all arrive as `(NULL, NULL)` — indistinguishable from an
+  empty result. `eval_js_checked()` works around it by `eval`-ing the script inside a
+  `try/catch` and returning the message as a value; `eval_js()` stays raw because the
+  internal probes want the plain string.
+- **`eval` needs one command-line argument.** On Windows the script is split on
+  spaces before V sees it, which is why a probe written `typeof window.X` used to
+  answer with an empty line: what ran was `typeof`.
 - **The window is ours.** `WKViewCreate(RECT, WKPageConfigurationRef, HWND)` takes a
   `RECT` **by value** and returns a child view, so `engine/wk_host.h` creates the frame
   (`WNDCLASSW` + `CreateWindowExW`, resizing the child on `WM_SIZE`) and `run()` is a

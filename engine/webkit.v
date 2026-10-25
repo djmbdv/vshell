@@ -379,15 +379,18 @@ fn wk_on_message(text &char, ctx voidptr) {
 
 fn wk_on_eval(value voidptr, err_ref voidptr, ctx voidptr) {
 	mut box := unsafe { &WkEvalBox(ctx) }
-	// Both strings are freshly allocated by wk_host.h; we own them and must free.
-	// (The parameter is not named `error`: that is a V builtin.)
-	if err_ref != unsafe { nil } {
-		p := unsafe { C.wk_type_to_utf8(err_ref) }
-		if p != unsafe { nil } {
-			box.err = wk_cstr(p)
-			C.wk_host_free(p)
-		}
+	// `err_ref` is always NULL in this API, so it is not converted: WebKit's
+	// WKPageEvaluateJavaScriptInFrame ends with
+	//     if (result) callback(toAPI(...), nullptr, context);
+	//     else        callback(nullptr, nullptr, context);
+	// (Source/WebKit/UIProcess/API/C/WKPage.cpp). A syntax error, a thrown
+	// exception and a cancelled evaluation are therefore indistinguishable here,
+	// which is why eval_js_checked() catches inside the script instead.
+	ignore := err_ref
+	if ignore != unsafe { nil } {
+		eprintln('vshell: note: WebKit reported an eval error reference, which the API is not documented to do')
 	}
+	// The string is freshly allocated by wk_host.h; we own it and must free.
 	if value != unsafe { nil } {
 		p := unsafe { C.wk_type_to_utf8(value) }
 		if p != unsafe { nil } {
@@ -644,6 +647,31 @@ pub fn (mut e WebKitEngine) eval_js(script string) !string {
 	return box.value
 }
 
+// eval_error_marker prefixes a result that came back from eval_js_checked() as a
+// caught exception. A control byte, so it cannot collide with a real string a
+// caller would want.
+const eval_error_marker = '\u0001'
+
+// eval_js_checked is eval_js with the two things a human running `--eval` needs:
+// exceptions become errors (WebKit will not tell us — see wk_on_eval), and a
+// non-string value is JSON-encoded instead of silently arriving as ''.
+//
+// The wrapping is also why the script must be passed as ONE argument: on Windows
+// a value with spaces is split by the command line, so the shell only receives the
+// first word and the wrapper then reports a syntax error that names the fragment.
+fn (mut e WebKitEngine) eval_js_checked(script string) !string {
+	wrapped := "(function(){try{var v=eval(${json2.encode(script)});" +
+		"if(typeof v==='string')return v;" +
+		"if(v===undefined)return 'undefined';" +
+		"try{return JSON.stringify(v)}catch(e2){return String(v)}}" +
+		"catch(err){return '\\u0001'+String((err&&err.name?err.name+': '+(err.message||''):'')||err)}})()"
+	rv := e.eval_js(wrapped)!
+	if rv.starts_with(eval_error_marker) {
+		return error(rv[eval_error_marker.len..])
+	}
+	return rv
+}
+
 pub fn (mut e WebKitEngine) queue_eval(script string) {
 	e.pending << script
 }
@@ -689,10 +717,14 @@ fn (mut e WebKitEngine) pump() {
 		body := e.eval_js('document.body && document.body.innerHTML.length > 0 && document.title ? "1" : "0"') or { '0' }
 		if body.int() > 0 || e.eval_ticks > 1200 {
 			for script in e.pending {
-				if rv := e.eval_js(script) {
+				if rv := e.eval_js_checked(script) {
 					println('vshell: eval -> ${rv}')
 				} else {
-					eprintln('vshell: eval failed: ${err}')
+					// The script goes into the message: on Windows a `--eval` value
+					// with spaces is split by the command line, so what arrives here
+					// is often the first word only ("typeof"). Printing it turns a
+					// mystifying empty result into an obvious one.
+					eprintln('vshell: eval failed: ${err} (script: ${script})')
 				}
 			}
 			e.pending = []

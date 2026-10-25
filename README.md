@@ -131,6 +131,21 @@ In the other direction, `engine.eval_js('<js>')` returns the value as a string
 (`--eval` is the CLI version). The payload **crosses as a string**: pass
 `JSON.stringify(obj)` from the page.
 
+`--eval` (the CLI) goes through `eval_js_checked()`, which is friendlier than the
+engine call: exceptions are reported instead of silently turning into an empty
+line, and a non-string value is JSON-encoded for you.
+
+```sh
+sh scripts/run.sh --eval '"document.title"'          # strings: quote it, see below
+sh scripts/run.sh --eval '"({a:1})"'                 # -> {"a":1}
+sh scripts/run.sh --eval '"null.x"'                  # -> eval failed: TypeError: ...
+```
+
+> Pass the script as **one** shell argument. On Windows the command line is split on
+> spaces, so `--eval 'typeof window.showDirectoryPicker'` arrives as `typeof` and the
+> rest is silently dropped — the failure message now names the fragment that was
+> actually evaluated.
+
 With the WebKit backend, `window.vshell` is injected as a `WKUserScript` that posts
 through `window.webkit.messageHandlers.vshell`, and `eval_js` is **asynchronous**
 underneath (the V side pumps messages until the callback arrives, 3 s timeout).
