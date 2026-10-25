@@ -48,6 +48,46 @@ if [ ! -d "${VS}/src" ]; then
 	exit 1
 fi
 
+# Native addons the REH loads at runtime. They are N-API (node-addon-api), so the
+# ABI is stable and Bun can load them — that was verified with a prebuilt `.node`
+# before this list existed. `node-pty` used to be the scary one and is N-API now
+# (1.2.0-beta.15); spdlog is optional (its import is guarded) but its absence
+# floods the log, and deviceid/windows-registry are imported by id.ts.
+NATIVES="node-pty @vscode/spdlog @vscode/deviceid @vscode/windows-registry"
+
+# node-gyp runs under BUN, not Node and not npm: `bun node_modules/node-gyp/bin/
+# node-gyp.js` reports `using node@26.x` (Bun emulates process.versions) and does
+# the whole configure step. Pinned in the repo's package.json so the version is
+# reproducible instead of whatever npm happens to bundle.
+build_natives() {
+	NODE_GYP="${HERE}/node_modules/node-gyp/bin/node-gyp.js"
+	if [ ! -f "${NODE_GYP}" ]; then
+		echo "ERROR: node-gyp is not installed. Run: bun install" >&2
+		return 1
+	fi
+	for pkg in ${NATIVES}; do
+		dir="${VS}/node_modules/${pkg}"
+		if [ ! -d "${dir}" ]; then
+			echo "  skip ${pkg} (not installed in the checkout)"
+			continue
+		fi
+		if ls "${dir}/build/Release/"*.node >/dev/null 2>&1; then
+			echo "  ok   ${pkg} (already built)"
+			continue
+		fi
+		echo "==> building ${pkg}"
+		(
+			cd "${dir}"
+			bun "${NODE_GYP}" rebuild
+		) || echo "  !! ${pkg} failed — see the VS components named in the error" >&2
+	done
+}
+
+if [ "${1:-}" = "--natives" ]; then
+	build_natives
+	exit $?
+fi
+
 echo "==> bundling server-web (this reuses the checkout, ~1-2 min)"
 (
 	cd "${VS}"

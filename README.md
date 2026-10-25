@@ -34,7 +34,8 @@ vshell (V, built with mingw-w64)
 |---|---|---|
 | **V 0.5.2** | builds the shell | `setup/install_v.ps1` |
 | **MSYS2 + gcc (ucrt64)** | links the C binding | `setup/install_toolchain.ps1` |
-| **Bun** | builds/serves the web artifact **and** runs the backend service; `bun install` in the repo root pulls `bun-pty` for the integrated terminal | [bun.sh](https://bun.sh) |
+| **Bun** | builds/serves the web artifact **and** runs the backend service; `bun install` in the repo root pulls `bun-pty` (terminal) and `node-gyp` (compile driver for the REH's native addons) | [bun.sh](https://bun.sh) |
+| **VS Build Tools** *(only to build the REH's natives)* | `node-gyp` compiles `node-pty`, `spdlog`, `deviceid`, `windows-registry` with it: needs **Desktop development with C++**, a **Windows SDK** and the **Spectre-mitigated libs**. Node and npm are **not** needed — `node-gyp` itself runs on Bun (`bun node_modules/node-gyp/bin/node-gyp.js`) | [VS installer](https://visualstudio.microsoft.com/downloads/) |
 | **WebKit (WinCairo), Windows x64** | the engine | `perl Tools/Scripts/build-webkit --release` in a `WebKit/WebKit` checkout, then stage it (below). There is no SDK to download. |
 | *Optional:* Ultralight SDK 2.0.0-beta.2 (free, win-x64) | only to re-enable the archived backend: `mv engine/ultralight.v.disabled engine/ultralight.v` and restore its branch in `new_engine()` | download and extract into `.work/ul-sdk` |
 

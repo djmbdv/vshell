@@ -215,10 +215,13 @@ Status after the first spike (`scripts/build_reh.sh`, 2026-10-25):
       build without that native killed the server with an unhandled rejection
       before it served anything. Patched in `configure_vscode_for_bun.sh`; worth
       reporting upstream.
-- [ ] Build the natives. `npm rebuild @vscode/spdlog` fails here with **MSB8040**:
-      the VS 2026 Build Tools install lacks the Spectre-mitigated CRT libs. spdlog
-      itself is optional (its import is guarded), but `deviceid`/`windows-registry`
-      are needed for telemetry/identity and `node-pty` for the terminal.
+- [ ] Build the natives. `scripts/build_reh.sh --natives` drives `node-gyp` **on Bun**
+      (pinned as a devDependency; npm and Node are not involved, which also matters
+      because `bunx node-gyp` on Windows silently re-executes `node.exe`). It stops
+      with node-gyp's own diagnosis: the VS 2026 Build Tools here report
+      `found VC++ toolset: v145` but **`missing any Windows SDK`**, and MSBuild then
+      fails with **MSB8040** (Spectre-mitigated libs). So the missing pieces are VS
+      components, not code: the Windows SDK + the Spectre CRT libs.
 - [ ] Verify the extension host process actually spawns under Bun when a client
       connects (the WS handshake is accepted; a per-window ext host was not observed
       yet, which is expected without the auth/initialize exchange).
