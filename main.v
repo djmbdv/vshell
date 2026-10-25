@@ -40,6 +40,11 @@ mut:
 	// origin (serving everything and terminating the WebSocket) and forwards to it —
 	// the REH's own `node:http` upgrade does not survive under Bun with our WebKit.
 	reh         string
+	// no_cache tells the proxy to answer `Cache-Control: no-store`. The REH marks its
+	// static tree with a one-year max-age and no validator, so after rebuilding the
+	// workbench the browser keeps running the old bundle and every change looks like
+	// it did nothing. Development flag; the default keeps the cache.
+	no_cache    bool
 	// evals are JS snippets run in the page once it is live (a way to poke the
 	// bridge from the CLI without any UI).
 	evals       []string
@@ -96,7 +101,10 @@ fn run() !int {
 
 	mut server := WebServer{}
 	if opts.url == '' {
-		extra := if opts.reh != '' { ['--upstream', opts.reh] } else { []string{} }
+		mut extra := if opts.reh != '' { ['--upstream', opts.reh] } else { []string{} }
+		if opts.no_cache {
+			extra << '--no-cache'
+		}
 		server = start_web_server(serve_script, opts.web_root, opts.port, extra)!
 		println('vshell: web server pid=${server.pid} port=${server.port}')
 		if opts.reh != '' {
@@ -271,6 +279,10 @@ fn parse_args(args []string) Options {	mut opts := Options{}
 				} else {
 					i++
 				}
+			}
+			'--no-cache' {
+				opts.no_cache = true
+				i++
 			}
 			'--eval' {
 				// Take EVERY following token that is not another flag. On Windows the

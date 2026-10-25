@@ -94,12 +94,35 @@ build_natives() {
 	done
 }
 
+# node-pty ships Microsoft's ConPTY redistribution (`conpty.dll` + `OpenConsole.exe`)
+# under third_party/, but the native module we build from source looks for it in
+# `<its own dir>/conpty/`, i.e. build/Release/conpty/. The npm flow does that copy and
+# a plain `node-gyp rebuild` does not, so without this every terminal in the workbench
+# dies with "Cannot find conpty.dll at ... while everything else looks healthy:
+#   - the pty host starts, the spawn fails, and the error only reaches the terminal UI.
+# Only Windows has the source dir, so elsewhere this is a no-op.
+install_conpty_dlls() {
+	np="${VS}/node_modules/node-pty"
+	[ -d "${np}/third_party/conpty" ] || return 0
+	src="$(ls -d "${np}"/third_party/conpty/*/win10-x64 2>/dev/null | sort | tail -1)"
+	[ -n "${src}" ] || return 0
+	mkdir -p "${np}/build/Release/conpty"
+	for f in conpty.dll OpenConsole.exe; do
+		if [ -f "${src}/${f}" ] && [ ! -f "${np}/build/Release/conpty/${f}" ]; then
+			cp "${src}/${f}" "${np}/build/Release/conpty/${f}"
+			echo "  conpty: ${f} -> node-pty/build/Release/conpty (VS Code's default uses it)"
+		fi
+	done
+}
+
 if [ "${1:-}" = "--natives" ]; then
 	build_natives
+	install_conpty_dlls
 	exit $?
 fi
 
 echo "==> bundling server-web (this reuses the checkout, ~1-2 min)"
+install_conpty_dlls
 (
 	cd "${VS}"
 	bun build/next/index.ts bundle --target server-web --out out-vscode-reh-web

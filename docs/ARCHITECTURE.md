@@ -262,6 +262,25 @@ inside the engine's update callback deadlocks**.
 
 ## 6. The extension host on Bun
 
+### 6.1 Where the client actually lives
+
+Two things about the web client cost hours and are worth writing down:
+
+- The workbench is **one module**, `out/vs/code/browser/workbench/workbench.js` (38 MB
+  in this build). `out/vs/workbench/workbench.web.main.internal.js` exists next to it
+  and is *not* what the page loads — instrumenting that file produces nothing at all.
+- The REH serves `/static` with `Cache-Control: public, max-age=31536000` and **no
+  validator** (no ETag, no Last-Modified). So a copy WebKit has seen once can never be
+  revalidated away: after rebuilding, the page keeps running the old module and every
+  change looks like it did nothing. `--no-cache` (shell → proxy) answers `no-store`,
+  which fixes future loads; to replace an entry already in the cache, use a different
+  `--port`, because the cache is keyed by origin. Rewriting the asset URLs in the HTML
+  instead does not work: the page's inline scripts are pinned by `sha256` in its
+  Content-Security-Policy, so editing the one that sets `_VSCODE_FILE_ROOT` makes the
+  browser block it and the workbench never boots.
+
+### 6.2 The two Bun gaps that mattered
+
 The REH route (`ROADMAP.md`, Phase 2b) inherits VS Code's own Node-half services, so
 the only interesting question is whether its extension host can run on Bun. It can,
 but two Bun gaps sit exactly on the path and both fail **silently** — they produce no

@@ -25,6 +25,14 @@ const base = root.replace(/[\\/]+$/, '')
 // everything that is not ours is forwarded to a vscode-reh-web. See web/proxy.js for
 // why the shell terminates the WebSocket instead of letting the REH do it.
 const upstream = opt('upstream', process.env.VSHELL_UPSTREAM ?? '')
+// The REH marks everything under /static with `Cache-Control: max-age=31536000` and
+// sends no validator, which is right for a released build and wrong while iterating:
+// the workbench is one 38 MB module, so WebKit keeps the old copy and every change
+// looks like it did nothing. `--no-cache` answers `no-store` from then on; a stale
+// entry already in the cache needs a different origin to be replaced, i.e. a
+// different --port (rewriting the URLs instead is blocked by the page's CSP, which
+// pins its inline scripts by hash).
+const noCache = argv.includes('--no-cache') || process.env.VSHELL_NO_CACHE === '1'
 // VSHELL_ACCESS_LOG=1 logs every request: handy to watch the embedded engine
 // load the workbench (the V shell inherits the env and passes it to this child).
 const accessLog = process.env.VSHELL_ACCESS_LOG === '1'
@@ -133,7 +141,7 @@ const server = Bun.serve({
         if (r === PROXY_UPGRADED) return undefined
         return r
       }
-      return proxyRequest(req, url, upstream)
+      return proxyRequest(req, url, upstream, { noCache })
     }
 
     // The Codebun backend (filesystem, terminal). Mounted before the static

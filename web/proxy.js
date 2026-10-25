@@ -111,9 +111,8 @@ export function handleProxyUpgrade(req, url, server, upstreamBase) {
  * a request arriving with our port in `Origin` and its own in `Host` is the kind of
  * mismatch that fails with a bare 403 and no explanation.
  */
-export async function proxyRequest(req, url, upstreamBase) {
+export async function proxyRequest(req, url, upstreamBase, options = {}) {
   const target = new URL(url.pathname + url.search, upstreamBase)
-
   const headers = new Headers(req.headers)
   for (const h of REQUEST_HOP_BY_HOP) headers.delete(h)
   headers.delete('host')
@@ -154,6 +153,17 @@ export async function proxyRequest(req, url, upstreamBase) {
 
   const out = new Headers(response.headers)
   for (const h of RESPONSE_DROP) out.delete(h)
+  // The REH marks /static with a one-year max-age and sends no validator, so a stale
+  // copy can never be revalidated away (see --no-cache in web/serve.js).
+  //
+  // Rewriting the HTML to version those URLs is NOT an option: the page's inline
+  // scripts are pinned by sha256 in its Content-Security-Policy, so any edit to them
+  // — including the one setting `_VSCODE_FILE_ROOT` — is blocked by the browser and
+  // the workbench never boots. A fresh origin is what actually invalidates the cache,
+  // so when iterating on the workbench itself, pick a different `--port`.
+  if (options.noCache && (req.method === 'GET' || req.method === 'HEAD')) {
+    out.set('cache-control', 'no-store')
+  }
   // A redirect must send the page back to OUR origin, or the browser leaves the
   // proxy and lands on the REH directly (and the socket breaks again).
   const location = out.get('location')

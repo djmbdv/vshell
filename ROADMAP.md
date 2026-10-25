@@ -257,16 +257,29 @@ Status after the first spike (`scripts/build_reh.sh`, 2026-10-25):
 - [ ] Windows **named pipes** for `node:http`: the agent host gives up after five
       restarts with `ENOENT: no such file or directory, listen '\\.\pipe\vscode-ipc-…'`.
       Narrower than it first looked — `net.createServer().listen('\\\\.\\pipe\\x')`
-      works in Bun, so this is specifically the HTTP server's pipe listener.
-- [ ] Terminal through the REH (`ptyHost` child under Bun + `node-pty`). The addon is
-      built and loads in Bun, but the pty host has not been exercised yet.
+      works in Bun, so this is specifically the HTTP server's pipe listener, and it is
+      what keeps the Copilot agent host out of this build.
+- [x] Terminal through the REH (`ptyHost` child under Bun + `node-pty`). It works, and
+      the last blocker was not Bun at all: `node-pty` ships Microsoft's ConPTY
+      (`conpty.dll` + `OpenConsole.exe`) under `third_party/`, but the native module
+      looks for it next to itself in `build/Release/conpty/`, and a from-source
+      `node-gyp rebuild` does not copy it there. VS Code's default is to *use* that
+      DLL (`terminal.integrated.experimental.windowsUseConptyDll`), so every spawn
+      died with `Cannot find conpty.dll at …` — visible only in the terminal UI, which
+      is why the pty host looked healthy: it starts, then the spawn fails.
+      `scripts/build_reh.sh` now places the DLLs; measured afterwards: the pty host
+      (a `bun.exe`) has `OpenConsole.exe` + `powershell.exe` children, so the terminal
+      is a real ConPTY shell running off Bun.
 - [ ] Build `@vscode/sqlite3` as well: the agent host logs
       `Cannot find module '../build/Release/vscode-sqlite3.node'` and falls back.
 - [ ] Judge case by case whether it stays on Bun. **Plan B is an embedded Node
       server, and activating it breaks "everything on Bun" — decide that
       explicitly, never by drift.**
 
-**Acceptance:** Node-based extensions activate and the terminal keeps working.
+**Acceptance:** ✅ met on Windows. A real third-party extension (ESLint 3.0.34) loads
+and activates inside the remote extension host running on Bun, and the workbench
+terminal spawns a real ConPTY shell (`OpenConsole.exe` + `powershell.exe`) under a
+pty host that is itself `bun.exe`.
 
 ---
 
