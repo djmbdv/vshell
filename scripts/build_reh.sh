@@ -61,10 +61,16 @@ fi
 
 # Native addons the REH loads at runtime. They are N-API (node-addon-api), so the
 # ABI is stable and Bun can load them — that was verified with a prebuilt `.node`
-# before this list existed. `node-pty` used to be the scary one and is N-API now
-# (1.2.0-beta.15); spdlog is optional (its import is guarded) but its absence
-# floods the log, and deviceid/windows-registry are imported by id.ts.
-NATIVES="node-pty @vscode/spdlog @vscode/deviceid @vscode/windows-registry @vscode/sqlite3"
+# before this list existed, and again when the terminal turned out to need exactly
+# that. `node-pty` is deliberately NOT here: it ships prebuilds/win32-x64 with
+# conpty.node, conpty_console_list.node and, crucially, conpty/{conpty.dll,
+# OpenConsole.exe} — the layout its native module looks for. A from-source build
+# shadows those prebuilds with a build/Release that has no conpty/ folder, which is
+# what made every terminal die with "Cannot find conpty.dll" (see
+# install_conpty_dlls). Measured under Bun with only the prebuilds present: both
+# useConptyDll true and false spawn and echo. spdlog/deviceid/windows-registry/
+# sqlite3 have no prebuilds, so those four still need the VS toolchain.
+NATIVES="@vscode/spdlog @vscode/deviceid @vscode/windows-registry @vscode/sqlite3"
 
 # node-gyp runs under BUN, not Node and not npm: `bun node_modules/node-gyp/bin/
 # node-gyp.js` reports `using node@26.x` (Bun emulates process.versions) and does
@@ -94,15 +100,14 @@ build_natives() {
 	done
 }
 
-# node-pty ships Microsoft's ConPTY redistribution (`conpty.dll` + `OpenConsole.exe`)
-# under third_party/, but the native module we build from source looks for it in
-# `<its own dir>/conpty/`, i.e. build/Release/conpty/. The npm flow does that copy and
-# a plain `node-gyp rebuild` does not, so without this every terminal in the workbench
-# dies with "Cannot find conpty.dll at ... while everything else looks healthy:
-#   - the pty host starts, the spawn fails, and the error only reaches the terminal UI.
-# Only Windows has the source dir, so elsewhere this is a no-op.
+# Only relevant if node-pty is ever built from source: its native module resolves
+# `<its own dir>/conpty/conpty.dll`, and `node-gyp rebuild` does not copy Microsoft's
+# ConPTY redistribution there (npm's install script does). VS Code's default is to use
+# that DLL, so a from-source build spawns nothing and says so only in the terminal UI.
+# The prebuilds already contain the folder, so with the default setup this is a no-op.
 install_conpty_dlls() {
 	np="${VS}/node_modules/node-pty"
+	[ -d "${np}/build/Release" ] || return 0
 	[ -d "${np}/third_party/conpty" ] || return 0
 	src="$(ls -d "${np}"/third_party/conpty/*/win10-x64 2>/dev/null | sort | tail -1)"
 	[ -n "${src}" ] || return 0
@@ -110,7 +115,7 @@ install_conpty_dlls() {
 	for f in conpty.dll OpenConsole.exe; do
 		if [ -f "${src}/${f}" ] && [ ! -f "${np}/build/Release/conpty/${f}" ]; then
 			cp "${src}/${f}" "${np}/build/Release/conpty/${f}"
-			echo "  conpty: ${f} -> node-pty/build/Release/conpty (VS Code's default uses it)"
+			echo "  conpty: ${f} -> node-pty/build/Release/conpty (from-source build)"
 		fi
 	done
 }

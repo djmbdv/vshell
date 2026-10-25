@@ -221,8 +221,13 @@ Status after the first spike (`scripts/build_reh.sh`, 2026-10-25):
       stopped with node-gyp's own diagnosis — `missing any Windows SDK` plus **MSB8040**
       (the `binding.gyp` files ask for Spectre-mitigated libs) — so the missing pieces
       were VS components, not code. With the Windows SDK and the Spectre CRT libs
-      installed, all five addons build (`node-pty/conpty.node`, `spdlog.node`,
-      `windows.node`, `winregistry.node`, …) and **load in Bun**.
+      installed, they build (`spdlog.node`, `windows.node`, `winregistry.node`,
+      `sqlite3.node`) and **load in Bun**.
+      `node-pty` is *excluded* on purpose: it ships prebuilds (N-API, so Bun-ready)
+      that also carry `conpty/{conpty.dll, OpenConsole.exe}` in the layout its native
+      module looks for. Building it from source shadows those prebuilds with a
+      `build/Release` that has no `conpty/` folder — that was the terminal bug, not
+      Bun and not a missing pty implementation.
 - [x] Verify the extension host process actually spawns under Bun when a client
       connects. **It does**, once the socket survives: `[ExtensionHostConnection] New
       connection established`, `Launched Extension Host Process`, and the child (a
@@ -267,9 +272,11 @@ Status after the first spike (`scripts/build_reh.sh`, 2026-10-25):
       DLL (`terminal.integrated.experimental.windowsUseConptyDll`), so every spawn
       died with `Cannot find conpty.dll at …` — visible only in the terminal UI, which
       is why the pty host looked healthy: it starts, then the spawn fails.
-      `scripts/build_reh.sh` now places the DLLs; measured afterwards: the pty host
-      (a `bun.exe`) has `OpenConsole.exe` + `powershell.exe` children, so the terminal
-      is a real ConPTY shell running off Bun.
+      The fix is to *not build node-pty*: its prebuilds already contain `conpty/`, so
+      the build script leaves it alone (`install_conpty_dlls` stays as a guard for
+      anyone who builds it anyway). Measured afterwards, with nothing compiled for
+      node-pty: the pty host (a `bun.exe`) has `OpenConsole.exe` + `powershell.exe`
+      children, so the terminal is a real ConPTY shell running off Bun.
 - [ ] Build `@vscode/sqlite3` as well: the agent host logs
       `Cannot find module '../build/Release/vscode-sqlite3.node'` and falls back.
 - [ ] Judge case by case whether it stays on Bun. **Plan B is an embedded Node
