@@ -47,10 +47,30 @@ ESLint (Node extensions) stay out until Phase 2b.
 
 ## Security
 
-The Bun service listens on `127.0.0.1` and only checks that a request which *sends*
-an `Origin` sends the right one. That is a coarse filter against a stray web page and
-nothing more: any local process can forge the header, and a browser omits `Origin`
-entirely on same-origin GETs (which is why requiring it — the first version — broke
-the editor's own reads). A token is the intended design and is **not implemented
-yet**; it must arrive before anything destructive is added. Do not treat the current
-check as isolation.
+The Bun service listens on `127.0.0.1` and is gated by a **per-run token**, not only
+by `Origin`. The shell generates 256 random bits at startup (`main.v`, `new_token`),
+exports them as `VSHELL_TOKEN` before spawning the Bun child, and delivers them to
+the page **out of band**: the engine injects them as a document-start user script
+(`engine/webkit.v`, `build_user_script`), so the token never travels in a URL and
+never appears in an HTTP response a local process could fetch.
+
+The page re-broadcasts `{ token, folder }` on a same-origin `BroadcastChannel`
+(`codebun-bootstrap`); the extension host worker answers with the same channel, and
+from then on sends the token on every call as `X-Codebun-Token`. A WebSocket cannot
+carry request headers, so the terminal passes the same secret as `?token=` (the
+server accepts either carrier, it is the same check). The service answers `401`
+before routing when the token is missing or wrong, and `403` when a request carries
+an `Origin` that does not match `Host`.
+
+What that boundary *is*: “the engine delivered the page”. The token's secrecy rests
+on the BroadcastChannel being origin-scoped and not network reachable — not on
+cryptography against a local process that can already inject script into that
+origin. Do not describe it as isolation. When no token is set (standalone
+`bun run web/serve.js`, the dev case) the service is **open**, which is why
+destructive endpoints are gated behind an explicit decision:
+
+| endpoint | state |
+| --- | --- |
+| `stat`, `readdir`, `read`, `write`, `mkdir` | implemented, token required when the shell runs |
+| `delete` | **501** on purpose: destructive, lands together with a test that the 401 path fires |
+| `rename` (extension) | throws: a wrong rename loses data, so it is not faked |

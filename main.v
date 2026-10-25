@@ -1,6 +1,7 @@
 module main
 
 import os
+import rand
 import engine
 
 // vshell entrypoint.
@@ -26,9 +27,30 @@ mut:
 	port        int    = default_port
 	web_root    string = default_web_root
 	dev_mode    bool
+	// folder is the workspace to open. --folder sets it directly; --open-folder
+	// asks the OS for it with the native dialog. Both feed the page bootstrap,
+	// so the workbench opens the folder without a reload.
+	folder      string
+	open_folder bool
 	// evals are JS snippets run in the page once it is live (a way to poke the
 	// bridge from the CLI without any UI).
 	evals       []string
+}
+
+// new_token returns a 256-bit session token as hex. It gates the Bun backend so
+// a process other than this shell cannot drive the file-system service (see
+// web/backend.js). rand.intn is used instead of a dedicated CSPRNG call so this
+// keeps working across V versions; 32 uniform bytes are well past enough for a
+// loopback token that only lives for one run.
+fn new_token() string {
+	hex_digits := '0123456789abcdef'
+	mut out := []u8{cap: 64}
+	for _ in 0 .. 32 {
+		n := rand.intn(256) or { 0 }
+		out << hex_digits[n >> 4]
+		out << hex_digits[n & 0xf]
+	}
+	return out.bytestr()
 }
 
 fn main() {
@@ -44,6 +66,26 @@ fn main() {
 fn run() !int {
 	opts := parse_args(os.args)
 
+	// The session token gates the Bun backend. The Bun child is spawned from this
+	// process (start_web_server), so it inherits the value through the
+	// environment; the page then receives it out-of-band, in the engine's user
+	// script (see set_bootstrap). It is never written to disk and never put in a
+	// URL.
+	token := new_token()
+	os.setenv('VSHELL_TOKEN', token, true)
+
+	// Pick the workspace before the window exists: the engine injects it into the
+	// page as a document-start user script, so it must be known up front. A
+	// native dialog with no owner still works, it is just not docked modally.
+	mut folder := opts.folder
+	if folder == '' && opts.open_folder {
+		if chosen := engine.pick_folder() {
+			folder = chosen
+		} else {
+			println('vshell: no folder chosen (starting without a workspace)')
+		}
+	}
+
 	mut server := start_web_server(serve_script, opts.web_root, opts.port)!
 	defer {
 		server.stop()
@@ -57,8 +99,13 @@ fn run() !int {
 	}
 
 	mut eng := engine.new_engine(opts.engine_kind)!
+	eng.set_bootstrap(token, folder)
 	url := 'http://127.0.0.1:${opts.port}/'
 	eng.create_window('vshell', url, 1280, 800, opts.dev_mode)!
+
+	if folder != '' {
+		println('vshell: folder ${folder}')
+	}
 
 	if opts.dev_mode {
 		// Ultralight Free has no remote inspector, and WebKit/WinCairo has no remote
@@ -116,6 +163,18 @@ fn parse_args(args []string) Options {
 			}
 			'--devtools' {
 				opts.dev_mode = true
+				i++
+			}
+			'--folder' {
+				if i + 1 < args.len {
+					opts.folder = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--open-folder' {
+				opts.open_folder = true
 				i++
 			}
 			'--eval' {

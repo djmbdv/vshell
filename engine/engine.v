@@ -14,6 +14,12 @@ mut:
 	// create_window opens the top-level window pointing at `url`. dev_mode turns
 	// on the engine's developer diagnostics (and is needed for the inspector).
 	create_window(title string, url string, width int, height int, dev_mode bool) !
+	// set_bootstrap hands the page the shell's session data — the backend token
+	// and the folder the user opened — before it loads. Out-of-band by design:
+	// the WebKit backend injects it as a user script, never through a URL or an
+	// HTTP response the page could be tricked into re-fetching. Both may be
+	// empty, which is the standalone/dev case.
+	set_bootstrap(token string, folder string)
 	// load_url navigates the current window.
 	load_url(url string) !
 	// run blocks until the last window is closed.

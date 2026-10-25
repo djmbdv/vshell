@@ -8,7 +8,7 @@
 
 import { join } from 'node:path'
 
-import { handleBackend } from './backend.js'
+import { handleBackend, websocket, UPGRADED } from './backend.js'
 
 const argv = process.argv.slice(2)
 const opt = (name, def) => {
@@ -110,6 +110,9 @@ async function renderHostPage() {
 const server = Bun.serve({
   hostname: host,
   port,
+  // The terminal (web/backend.js) tunnels a PTY over a WebSocket, so the server
+  // needs the handlers; the upgrade itself is decided in the fetch below.
+  websocket,
   async fetch(req) {
     const url = new URL(req.url)
     // Collapse repeated slashes: the template computes its file root as
@@ -117,10 +120,15 @@ const server = Bun.serve({
     const pathname = decodeURIComponent(url.pathname).replace(/\/{2,}/g, '/')
     if (accessLog) console.log(`vshell-web: ${req.method} ${pathname}`)
 
-    // The Codebun backend (filesystem for now, terminal and search later).
-    // Mounted before the static handling so no file named like a route can
-    // shadow it. See web/backend.js.
-    const backend = await handleBackend(req, pathname)
+    // The Codebun backend (filesystem, terminal). Mounted before the static
+    // handling so no file named like a route can shadow it. See web/backend.js.
+    // It also owns the WebSocket upgrade, which is why it is handed `server`:
+    // on a successful upgrade it returns UPGRADED and this fetch must yield
+    // undefined so Bun can complete the handshake itself.
+    const backend = await handleBackend(req, pathname, server)
+    if (backend === UPGRADED) {
+      return undefined
+    }
     if (backend) return backend
 
     // The workbench host page (a rendered template, not a static file).

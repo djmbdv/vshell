@@ -25,6 +25,14 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Native folder picker (wk_host_pick_folder, below). Only Win32/COM, no WebKit:
+ * IFileOpenDialog is the modern replacement for the SHBrowseForFolder tree and
+ * is what the OS's own "Choose folder" uses. objbase.h brings CoInitializeEx /
+ * CoCreateInstance / CoTaskMemFree; shobjidl.h brings IFileOpenDialog and the
+ * FOS_* option flags. */
+#include <objbase.h>
+#include <shobjidl.h>
+
 /* WebKit's WKBaseWin.h (pulled in by WKBase.h when _WIN32) does an unguarded
  * `typedef int pid_t;`. mingw-w64's <sys/types.h> has already typedef'd pid_t as
  * `long long`, and it arrives here through libgc -> <process.h>, so the two
@@ -336,6 +344,75 @@ static void wk_host_destroy(void* state)
 }
 
 /* -------------------------------------------------------------------------- */
+/* folder dialog (the shell's first native API)                                */
+/* -------------------------------------------------------------------------- */
+
+/* Shows the OS "choose a folder" dialog. Returns a malloc'd UTF-8 absolute path
+ * (free it with wk_host_free) or NULL when the user cancelled or anything failed.
+ *
+ * `parent` may be NULL: the shell asks for the folder BEFORE its window exists,
+ * because the page-side bridge (the WKUserScript) has to carry the chosen path
+ * from the very first document, and a user script is injected at document start.
+ * A dialog with no owner still works, it is just not docked modally to a frame.
+ *
+ * FOS_FORCEFILESYSTEM guarantees the result has a file-system path, so
+ * SIGDN_FILESYSPATH below cannot come back empty for a shell-only location. */
+static char* wk_host_pick_folder(void* parent)
+{
+    IFileOpenDialog* dlg = NULL;
+    IShellItem* item = NULL;
+    PWSTR wpath = NULL;
+    char* out = NULL;
+    HRESULT hr;
+    DWORD opts;
+    int com_ok = 0;
+
+    /* WebKit's WinCairo process may already have initialised COM (OleInitialize
+     * in its own startup). A second CoInitializeEx on the same thread with a
+     * different model returns RPC_E_CHANGED_MODE: that is not a failure for us,
+     * the apartment exists and we simply must not uninitialise it. */
+    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (SUCCEEDED(hr))
+        com_ok = 1;
+    else if (hr != RPC_E_CHANGED_MODE)
+        return NULL;
+
+    hr = CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IFileOpenDialog, (void**)&dlg);
+    if (SUCCEEDED(hr)) {
+        hr = dlg->lpVtbl->GetOptions(dlg, &opts);
+        if (SUCCEEDED(hr))
+            hr = dlg->lpVtbl->SetOptions(dlg,
+                                         opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        if (SUCCEEDED(hr))
+            hr = dlg->lpVtbl->Show(dlg, (HWND)parent);
+        if (SUCCEEDED(hr))
+            hr = dlg->lpVtbl->GetResult(dlg, &item);
+        if (SUCCEEDED(hr) && item) {
+            hr = item->lpVtbl->GetDisplayName(item, SIGDN_FILESYSPATH, &wpath);
+            if (SUCCEEDED(hr) && wpath) {
+                /* Ask for the size first (with -1 the count INCLUDES the NUL),
+                 * then convert into exactly that buffer. */
+                int n = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, NULL, 0, NULL, NULL);
+                if (n > 0) {
+                    out = (char*)malloc((size_t)n);
+                    if (out)
+                        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out, n, NULL, NULL);
+                }
+                CoTaskMemFree(wpath);
+            }
+        }
+        if (item)
+            item->lpVtbl->Release(item);
+        dlg->lpVtbl->Release(dlg);
+    }
+
+    if (com_ok)
+        CoUninitialize();
+    return out;
+}
+
+/* -------------------------------------------------------------------------- */
 /* page / configuration / bridge                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -474,10 +551,20 @@ static char* wk_page_copy_title(void* page)
 
 static char* wk_page_copy_url(void* page)
 {
-    WKStringRef s = WKPageCopyActiveURL((WKPageRef)page);
-    char* buf = wk_type_to_utf8((void*)s);
-    if (s)
-        WKRelease((WKTypeRef)s);
+    /* WKPageCopyActiveURL returns a WKURLRef (+1), NOT a string. The previous
+     * version assigned it straight to a WKStringRef, which (a) is an
+     * incompatible-pointer-types error on GCC 14+ and (b) would have made
+     * wk_type_to_utf8 skip it forever, so page_url() always returned ''. Convert
+     * it with WKURLCopyString and release both references. */
+    WKURLRef url = WKPageCopyActiveURL((WKPageRef)page);
+    char* buf = NULL;
+    if (url) {
+        WKStringRef s = WKURLCopyString(url);   /* +1 */
+        buf = wk_type_to_utf8((void*)s);
+        if (s)
+            WKRelease((WKTypeRef)s);
+        WKRelease((WKTypeRef)url);
+    }
     return buf;
 }
 static void  wk_host_free(void* p)          { free(p); }

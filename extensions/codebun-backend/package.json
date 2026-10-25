@@ -18,8 +18,10 @@
 		"workspace"
 	],
 	"activationEvents": [
+		"onStartupFinished",
 		"onFileSystem:codebun",
 		"onCommand:codebun.openFolder",
+		"onCommand:codebun.terminal.new",
 		"onCommand:codebun.status"
 	],
 	"capabilities": {
@@ -36,15 +38,32 @@
 				"category": "Codebun"
 			},
 			{
+				"command": "codebun.terminal.new",
+				"title": "New Terminal",
+				"category": "Codebun"
+			},
+			{
 				"command": "codebun.status",
 				"title": "Show Backend Status",
 				"category": "Codebun"
 			}
 		],
+		"terminal": {
+			"profiles": [
+				{
+					"id": "codebun.terminal",
+					"title": "Codebun"
+				}
+			]
+		},
 		"menus": {
 			"commandPalette": [
 				{
 					"command": "codebun.openFolder",
+					"when": "isWeb"
+				},
+				{
+					"command": "codebun.terminal.new",
 					"when": "isWeb"
 				},
 				{

@@ -23,7 +23,8 @@ vshell (V, built with mingw-w64)
 | Workbench | ✅ boots inside the engine (themes, keybindings, extension host worker) |
 | JS ↔ V bridge | ✅ native `window.vshell` (frozen object) + `--eval` |
 | DevTools | ✅ real **Web Inspector** with the WebKit backend (`--devtools`) |
-| Next | our own backend — web extension + Bun service (Phase 2 in the [ROADMAP](./ROADMAP.md)) |
+| Backend (Phase 2) | ✅ our own: web extension (`extensions/codebun-backend`) + Bun service (`web/backend.js`) — folder picker, `codebun:` file system, and the integrated terminal (PTY over WebSocket, `bun-pty`). Workspace search and last-folder persistence are still open |
+| Next | workspace search, persisted last folder, then the shell's own UI (Phase 3 in the [ROADMAP](./ROADMAP.md)) |
 | Out of scope for now | Node-based extensions and the remote extension host (Phase 2b) |
 
 ## Requirements
@@ -32,7 +33,7 @@ vshell (V, built with mingw-w64)
 |---|---|---|
 | **V 0.5.2** | builds the shell | `setup/install_v.ps1` |
 | **MSYS2 + gcc (ucrt64)** | links the C binding | `setup/install_toolchain.ps1` |
-| **Bun** | builds and serves the web artifact | [bun.sh](https://bun.sh) |
+| **Bun** | builds/serves the web artifact **and** runs the backend service; `bun install` in the repo root pulls `bun-pty` for the integrated terminal | [bun.sh](https://bun.sh) |
 | **WebKit (WinCairo), Windows x64** | the engine | `perl Tools/Scripts/build-webkit --release` in a `WebKit/WebKit` checkout, then stage it (below). There is no SDK to download. |
 | *Optional:* Ultralight SDK 2.0.0-beta.2 (free, win-x64) | only to re-enable the archived backend: `mv engine/ultralight.v.disabled engine/ultralight.v` and restore its branch in `new_engine()` | download and extract into `.work/ul-sdk` |
 
@@ -61,7 +62,9 @@ Check the rest with `setup/check_env.ps1`.
 ## Quickstart
 
 ```sh
-# 0) one time only: toolchain (V + MSYS2/gcc) and the WebKit build (see Requirements)
+# 0) one time only: toolchain (V + MSYS2/gcc), the WebKit build (see Requirements)
+#    and the service's own dependencies (bun-pty, for the terminal)
+bun install
 
 # 1) build the web artifact (slow the first time, see below)
 sh scripts/build_web.sh
@@ -104,6 +107,8 @@ sh scripts/run.sh -- --port 9000 --web-root web/public
 | `--web-root <dir>` | directory to serve (defaults to `web/public`) |
 | `--devtools` | developer mode + open the engine's inspector |
 | `--eval '<js>'` | evaluate JS once the page is live (repeatable) |
+| `--open-folder` | ask for the workspace with the shell's **native** folder dialog before the window opens (what `scripts/run.sh` does by default) |
+| `--folder <path>` | open that folder directly, no dialog |
 
 ### JS ↔ V bridge
 
@@ -131,6 +136,14 @@ underneath (the V side pumps messages until the callback arrives, 3 s timeout).
 For any value that is not a string, return `JSON.stringify(...)` from the page: only
 strings come back directly.
 
+Next to `post`, the injected script exposes a request/response call and the shell's
+session data (details in `docs/ARCHITECTURE.md` §3.3):
+
+```js
+await vshell.call('dialog.openFolder')         // -> absolute path, or '' if cancelled
+window.__codebunBootstrap                      // { token, folder }  (out of band, not a URL)
+```
+
 API details, plus the origin and timing gotchas: `docs/ARCHITECTURE.md`.
 
 ## Layout
@@ -146,7 +159,9 @@ vshell/
 │   └── ultralight.v           Ultralight binding (legacy backend)
 ├── web/
 │   ├── serve.js               Bun server; renders the workbench host page
+│   ├── backend.js             Bun service behind the codebun: FS + terminal (token gated)
 │   └── public/                vscode-web artifact (generated; not versioned)
+├── extensions/codebun-backend web extension: FileSystemProvider, terminal, shell calls
 ├── scripts/                   see scripts/README.md
 ├── docs/ARCHITECTURE.md       engines, IPC, licensing, risks
 └── ROADMAP.md                 phases and acceptance criteria

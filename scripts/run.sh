@@ -58,8 +58,12 @@ if [ "$rebuild" = "1" ] || [ ! -x "bin/vshell.exe" ]; then
 fi
 
 # --- run ---------------------------------------------------------------------
+# Default: WebKit engine against the served build, and ask for a folder with the
+# shell's native dialog (vshell --open-folder -> engine/wk_host.h). Cancelling the
+# dialog is fine: the shell just starts without a workspace. Pass --folder <path>
+# to skip the dialog, or any other vshell args to override.
 if [ "${#args[@]}" -eq 0 ]; then
-	args=(--engine webkit --port 8123 --web-root web/public)
+	args=(--engine webkit --port 8123 --web-root web/public --open-folder)
 fi
 
 echo "==> vshell ${args[*]}"

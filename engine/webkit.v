@@ -22,6 +22,7 @@ module engine
 // rejects an import placed after a #include with "`import x` can only be
 // declared at the beginning of the file", even though the default compiler
 // accepts it, so the order here is deliberate.
+import json2
 import time
 
 #include "engine/wk_host.h"
@@ -36,6 +37,11 @@ import time
 #flag -L@VMODROOT/.work/wk/lib
 #flag -lWebKit2
 
+// COM + shell for wk_host_pick_folder (IFileOpenDialog -> ole32/shell32,
+// CLSID_FileOpenDialog -> uuid). Unrelated to WebKit; kept here because this
+// module is the only one that compiles the Win32 C glue.
+#flag -lole32 -loleaut32 -luuid -lshell32
+
 // --- what wk_host.h exposes to V (all handles are void*) ---------------------
 fn C.wk_host_create(title &char, width int, height int, on_close WkCloseCb, ctx voidptr) voidptr
 fn C.wk_host_hwnd(state voidptr) voidptr
@@ -47,6 +53,7 @@ fn C.wk_host_set_title(state voidptr, title &char)
 fn C.wk_host_wait(state voidptr, ms int)
 fn C.wk_host_pump_once(state voidptr) int
 fn C.wk_host_destroy(state voidptr)
+fn C.wk_host_pick_folder(parent voidptr) voidptr
 
 fn C.wk_page_configuration_create() voidptr
 fn C.wk_page_configuration_set_user_content_controller(config voidptr, ucc voidptr)
@@ -92,13 +99,131 @@ fn wk_cstr(p voidptr) string {
 // WebKit only delivers the message body, never the handler name, so the page
 // packs name and payload with an ASCII unit separator (0x1F) that cannot appear
 // in a method name. Swap for x.json2 if you prefer typed decoding.
-const vshell_user_script = '
-window.vshell = Object.freeze({
-	version: "vshell-bridge-wk",
-	post: (name, payload) => window.webkit.messageHandlers.vshell.postMessage(
-		String(name) + "\u001f" + (payload === undefined ? "" : String(payload))),
-});
+//
+// The script is NOT a const any more: it carries the shell's session token and
+// the folder it opened, which are per-run. See build_user_script().
+const vshell_user_script_head = '
+(function () {
+	var pending = {}, seq = 0;
+	window.vshell = Object.freeze({
+		version: "vshell-bridge-wk",
+		post: (name, payload) => window.webkit.messageHandlers.vshell.postMessage(
+			String(name) + "\u001f" + (payload === undefined ? "" : String(payload))),
+		// Request/response over the one-way post() channel: the page sends a call
+		// with an id, the shell answers later through __resolve(). The id and the
+		// pending resolvers live in this closure, not on the frozen object, so the
+		// object stays immutable while the machinery behind it does not.
+		call: function (method, args) {
+			return new Promise(function (resolve) {
+				var id = "r" + (++seq);
+				pending[id] = resolve;
+				window.vshell.post("vshell.call", JSON.stringify({ id: id, method: method, args: args || [] }));
+			});
+		},
+		dialog: {
+			openFolder: function () { return window.vshell.call("dialog.openFolder"); },
+		},
+		__resolve: function (id, value) {
+			var r = pending[id];
+			if (r) { delete pending[id]; r(value); }
+		},
+	});
+})();
 '
+
+// The bootstrap tail is appended to the head above. It is delivered to the page
+// as a WKUserScript at document start, so unlike everything the Bun server
+// serves it never appears in an HTTP response another local process could fetch
+// — the token only reaches a context the engine itself injected. The page then
+// re-broadcasts it on a same-origin BroadcastChannel, which is how the extension
+// host worker (which has no `window`) gets it. See extensions/codebun-backend.
+const vshell_user_script_tail = '
+(function () {
+	var boot = { token: "%TOKEN%", folder: "%FOLDER%" };
+	window.__codebunBootstrap = boot;
+	try {
+		var bc = new BroadcastChannel("codebun-bootstrap");
+		bc.onmessage = function (ev) {
+			var d = ev && ev.data;
+			if (!d) return;
+			if (d.type === "codebun:hello") {
+				bc.postMessage({ type: "codebun:bootstrap", token: boot.token, folder: boot.folder });
+			} else if (d.type === "codebun:pickFolder") {
+				window.vshell.dialog.openFolder().then(function (f) {
+					bc.postMessage({ type: "codebun:folderPicked", id: d.id, folder: f || "" });
+				});
+			}
+		};
+		bc.postMessage({ type: "codebun:bootstrap", token: boot.token, folder: boot.folder });
+	} catch (err) {}
+})();
+'
+
+// escape_for_js_string makes a value safe inside a double-quoted JS string
+// literal (the token and the folder path are interpolated into the tail above).
+// Only the bytes that would end the literal or break the source are escaped:
+// '\\' and '"' get a backslash, the usual whitespace gets its short form, and
+// other control bytes are dropped. Bytes >= 0x20 pass through untouched, so a
+// UTF-8 path stays UTF-8 — which is what WKStringCreateWithUTF8CString wants.
+fn escape_for_js_string(s string) string {
+	mut out := []u8{cap: s.len + 8}
+	for c in s.bytes() {
+		if c == 92 { // backslash
+			out << u8(92)
+			out << u8(92)
+		} else if c == 34 { // double quote
+			out << u8(92)
+			out << u8(34)
+		} else if c == 10 { // newline
+			out << u8(92)
+			out << u8(110)
+		} else if c == 13 { // carriage return
+			out << u8(92)
+			out << u8(114)
+		} else if c == 9 { // tab
+			out << u8(92)
+			out << u8(116)
+		} else if c >= 32 {
+			out << c
+		}
+	}
+	return out.bytestr()
+}
+
+// pick_folder_owned is the one place that calls the C dialog. `parent` is the
+// owner HWND: NULL for the startup prompt (no window yet), the frame's HWND for
+// an on-demand call so the dialog is properly modal to it.
+fn pick_folder_owned(parent voidptr) ?string {
+	p := C.wk_host_pick_folder(parent)
+	if p == unsafe { nil } {
+		return none
+	}
+	defer {
+		C.wk_host_free(p)
+	}
+	s := wk_cstr(p)
+	if s == '' {
+		return none
+	}
+	return s
+}
+
+// pick_folder shows the shell's native "choose a folder" dialog and returns the
+// chosen absolute path, or none when the user cancelled. Module-level (not an
+// Engine method) because it needs no engine state, and the shell calls it before
+// the window — and so before the engine — exists. There is no window to own the
+// dialog yet, so it is unowned (the on-demand path passes the HWND instead).
+pub fn pick_folder() ?string {
+	return pick_folder_owned(unsafe { nil })
+}
+
+// VsCall is the request half of the page -> shell call protocol: the page sends
+// this as JSON under the name "vshell.call" (see vshell_user_script_head).
+struct VsCall {
+	id     string
+	method string
+	args   []string
+}
 
 // ---------------------------------------------------------------------------
 // bridge state (Wk-prefixed so this file can coexist with ultralight.v while
@@ -149,6 +274,13 @@ mut:
 	// polled every ~250 ms anyway. They stay in the code because "why is the shell
 	// slow to appear" is the first question any perf change has to answer.
 	t0 time.Time
+
+	// Per-run values handed to the page as a user script (build_user_script):
+	// the shell's session token for the Bun backend, and the folder the user
+	// opened. Both default to '' — with no token the backend stays open, which is
+	// only meant for standalone development.
+	boot_token  string
+	boot_folder string
 }
 
 // pump() iterations between title polls (~30 x 8 ms = ~250 ms).
@@ -198,6 +330,23 @@ fn wk_on_eval(value voidptr, err_ref voidptr, ctx voidptr) {
 
 // --- Engine interface -------------------------------------------------------
 
+// set_bootstrap records what the page will be told through the injected user
+// script. Call it BEFORE create_window: the script is registered there and runs
+// at document start, so a later value would miss the first document.
+pub fn (mut e WebKitEngine) set_bootstrap(token string, folder string) {
+	e.boot_token = token
+	e.boot_folder = folder
+}
+
+// build_user_script renders the page-side bridge for this run: the frozen
+// vshell object plus the bootstrap tail carrying the token and the folder.
+fn (e WebKitEngine) build_user_script() string {
+	tail := vshell_user_script_tail
+		.replace('%TOKEN%', escape_for_js_string(e.boot_token))
+		.replace('%FOLDER%', escape_for_js_string(e.boot_folder))
+	return vshell_user_script_head + tail
+}
+
 pub fn (mut e WebKitEngine) create_window(title string, url string, width int, height int, dev_mode bool) ! {
 	e.t0 = time.now()
 	e.title = title
@@ -220,7 +369,7 @@ pub fn (mut e WebKitEngine) create_window(title string, url string, width int, h
 		return error('WKUserContentControllerCreate() returned NULL')
 	}
 	// Must be registered before the first load: user scripts run at document start.
-	C.wk_user_content_controller_add_user_script(e.ucc, vshell_user_script.str)
+	C.wk_user_content_controller_add_user_script(e.ucc, e.build_user_script().str)
 	C.wk_user_content_controller_add_message_handler(e.ucc, wk_on_message, voidptr(e))
 	C.wk_page_configuration_set_user_content_controller(e.config, e.ucc)
 	if dev_mode {
@@ -367,10 +516,19 @@ fn (mut e WebKitEngine) pump() {
 	}
 	if e.page_ready && e.pending.len > 0 {
 		e.eval_ticks++
-		// readyState completes on the bare host page; the workbench mounts later,
-		// so wait until the body has content (same heuristic as the Ultralight
-		// backend) before running the CLI evals.
-		body := e.eval_js('document.body ? document.body.innerHTML.length : 0') or { '0' }
+		// readyState completes on the bare host page, long before the workbench
+		// exists (the host page's <body> is empty and it sets no <title>), so the
+		// CLI evals wait for a page that has both content and a title of its own.
+		// For this shell that moment is "the workbench mounted", which is what
+		// `--eval 'document.title'` is supposed to observe. `eval_ticks` is the
+		// escape hatch for a page that never sets a title.
+		//
+		// The probe returns a STRING on purpose: eval_js only converts WKString
+		// results (wk_type_to_utf8), so a bare boolean or `.length` would come
+		// back as '' and the check could never pass — it would silently fall
+		// through to the tick cap, which is what made `--eval` look like it did
+		// nothing for a minute.
+		body := e.eval_js('document.body && document.body.innerHTML.length > 0 && document.title ? "1" : "0"') or { '0' }
 		if body.int() > 0 || e.eval_ticks > 1200 {
 			for script in e.pending {
 				if rv := e.eval_js(script) {
@@ -384,12 +542,23 @@ fn (mut e WebKitEngine) pump() {
 	}
 
 	// Drain what page script pushed through vshell.post().
+	//
+	// The inbox is swapped out before it is walked, not walked and then cleared:
+	// handle_call() evaluates JS, and evaluating JS pumps messages, which can run
+	// wk_on_message() again and push NEW entries onto e.inbox.msgs. Iterating the
+	// live array while it grows is the kind of bug that shows up later as a skipped
+	// or duplicated call, so the snapshot is taken first.
 	if e.inbox != unsafe { nil } && e.inbox.msgs.len > 0 {
-		for m in e.inbox.msgs {
-			eprintln('vshell: js->v ${m.name} ${m.payload}')
-		}
+		msgs := e.inbox.msgs
 		e.inbox.msgs = []
-	} 
+		for m in msgs {
+			if m.name == 'vshell.call' {
+				e.handle_call(m.payload)
+			} else {
+				eprintln('vshell: js->v ${m.name} ${m.payload}')
+			}
+		}
+	}
 
 	// Keep the frame's title bar in sync with the page (the workbench sets
 	// document.title, so this is what makes the window say something useful
@@ -410,6 +579,41 @@ fn (mut e WebKitEngine) pump() {
 			}
 		}
 	}
+}
+
+// handle_call answers one request/response call from the page.
+//
+// It runs on the pump tick, never inside a WebKit callback: showing a modal
+// dialog or evaluating JS from wk_on_message would re-enter the UI process and
+// hang — the rule the whole bridge follows. By the time this runs the message has
+// already been queued and the callback has returned.
+fn (mut e WebKitEngine) handle_call(payload string) {
+	call := json2.decode[VsCall](payload) or {
+		eprintln('vshell: ignoring malformed call payload: ${payload}')
+		return
+	}
+	match call.method {
+		'dialog.openFolder' {
+			// Owned by the frame now that there is one, so it is modal to it.
+			path := pick_folder_owned(e.hwnd) or { '' }
+			e.resolve_call(call.id, json2.encode(path))
+		}
+		else {
+			eprintln('vshell: unknown vshell call "${call.method}"')
+			// Resolve with null so the caller's promise does not hang: a Promise
+			// that never settles is worse than one that resolves to "unsupported".
+			e.resolve_call(call.id, 'null')
+		}
+	}
+}
+
+// resolve_call hands a result back to the page's pending promise. Both the id
+// and the value are JSON-encoded: a JSON string is also a valid JS string
+// literal, so a Windows path's backslashes arrive escaped correctly, which the
+// hand-quoting this replaced would have got wrong.
+fn (mut e WebKitEngine) resolve_call(id string, value_json string) {
+	script := 'window.vshell.__resolve(${json2.encode(id)}, ${value_json})'
+	e.eval_js(script) or { eprintln('vshell: could not resolve call ${id}: ${err}') }
 }
 
 // --- inspector / devtools ---------------------------------------------------
