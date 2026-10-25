@@ -117,6 +117,13 @@ if [ -f "${VS}/product.json" ]; then
 	cp "${VS}/product.json" "${REH}/product.json"
 fi
 
+# NLS is off in this build (see configure_vscode_for_bun.sh), but the extension host
+# still looks for the messages bundle and logs an ENOENT on every launch. An empty
+# table is what "no translations" means here, so the noise goes away for free.
+if [ ! -f "${REH}/out/nls.messages.json" ]; then
+	printf '{}\n' >"${REH}/out/nls.messages.json"
+fi
+
 # Junctions, not copies: node_modules is ~1 GB and this tree is disposable.
 for link in node_modules extensions; do
 	if command -v cmd >/dev/null 2>&1; then

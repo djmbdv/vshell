@@ -38,19 +38,25 @@ cat > "${PATCHER}" <<'BUNPATCH'
 const fs = require('node:fs');
 
 function patch(file, pairs) {
-  let s = fs.readFileSync(file, 'utf8');
+  const original = fs.readFileSync(file, 'utf8');
+  // The checkout may be CRLF (git autocrlf) while the patterns below are written with
+  // plain \n. Comparing normalised text keeps the patches working on both, and the file
+  // is written back with whatever line ending it already had.
+  const eol = original.includes('\r\n') ? '\r\n' : '\n';
+  const normalise = (text) => text.replace(/\r\n/g, '\n');
+  let s = normalise(original);
   let changed = 0;
   for (const [from, to] of pairs) {
-    if (s.includes(to)) continue;              // already applied
-    if (s.includes(from)) {
-      s = s.split(from).join(to);
+    if (s.includes(normalise(to))) continue;              // already applied
+    if (s.includes(normalise(from))) {
+      s = s.split(normalise(from)).join(normalise(to));
       changed++;
     } else {
-      console.log(`  ! pattern not found in ${file}: ${from.slice(0, 60)}...`);
+      console.log(`  ! pattern not found in ${file}: ${normalise(from).slice(0, 60)}...`);
     }
   }
   if (changed) {
-    fs.writeFileSync(file, s);
+    fs.writeFileSync(file, eol === '\n' ? s : s.replace(/\n/g, eol));
     console.log(`  patched ${file} (${changed} change${changed > 1 ? 's' : ''})`);
   } else {
     console.log(`  ok (already configured): ${file}`);
@@ -320,6 +326,82 @@ patch('src/vs/base/node/id.ts', [
 \t\t} catch (err) {`],
 ]);
 
+// The extension host has two ways to reach the renderer: the parent can hand it a
+// connected socket over fork IPC (`child.send(msg, socket)`), or it can listen on a
+// named pipe the child connects to itself.
+//
+// Bun carries fork IPC *messages* fine but silently drops the socket handle, so the
+// child never gets its transport: it waits for the 60s IPC timeout and exits with
+// code 0 having activated nothing — which reads exactly like "no extension works"
+// with no error anywhere. Bun's node:net does speak Windows named pipes (measured),
+// so under Bun we take the pipe transport. The condition is only about *which*
+// transport to use, so nothing else changes.
+patch('src/vs/server/node/extensionHostConnection.ts', [
+  [`\t\tthis._canSendSocket = (!isWindows || !this._environmentService.args['socket-path']);`,
+   `\t\t// vshell: Bun's fork IPC drops socket handles (child.send(msg, socket)), so the
+\t\t// extension host would never receive its transport. Ask for the named-pipe
+\t\t// transport instead, which Bun's node:net does support.
+\t\tconst bunRuntime = (globalThis as unknown as { Bun?: { version?: string } }).Bun;
+\t\tthis._canSendSocket = !bunRuntime && (!isWindows || !this._environmentService.args['socket-path']);`],
+]);
+
+// Even with the transport fixed, extension code cannot reach the `vscode` module on
+// Bun: the interceptor relies on `module.registerHooks` (Node 22) and, for CommonJS,
+// on patching `module._load`. Bun has neither — it ignores `_load` patches and has
+// no `registerHooks` — so every `require('vscode')` throws MODULE_NOT_FOUND and the
+// extension host reports the failure only to the client, where it is invisible.
+//
+// What every runtime does honour is ordinary node_modules resolution, so on Bun we
+// drop a real `vscode` package next to the extensions; it hands the requiring file
+// name back through a global, which is exactly the per-extension lookup the hooks
+// performed. `_initData` becomes `protected` so the subclass can read the extension
+// locations, and `installVscodeShimPackage` lives beside the interceptor.
+patch('src/vs/workbench/api/common/extHostRequireInterceptor.ts', [
+  [`\t\t@IExtHostInitDataService private readonly _initData: IExtHostInitDataService,`,
+   `\t\t// vshell: protected so a subclass can install a runtime-specific shim (see
+\t\t// installVscodeShimPackage); it needs the extension locations.
+\t\t@IExtHostInitDataService protected readonly _initData: IExtHostInitDataService,`],
+]);
+
+patch('src/vs/workbench/api/node/extHostExtensionService.ts', [
+  [`import { DisposableStore, toDisposable } from '../../../base/common/lifecycle.js';
+const require = nodeModule.createRequire(import.meta.url);`,
+   `import { DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
+import { IExtHostInitDataService } from '../common/extHostInitDataService.js';
+const require = nodeModule.createRequire(import.meta.url);`],
+
+  [`\t\t};
+\t\tconst hooks = nodeModule.registerHooks({`,
+   `\t\t};
+
+\t\tif (typeof nodeModule.registerHooks !== 'function') {
+\t\t\t// vshell/Bun: no sync module hooks, so the data-url path above is unreachable.
+\t\t\t// A real package on disk replaces it; the URL it reports is the requiring module,
+\t\t\t// which is how the API instance stays per extension.
+\t\t\tthis._store.add(toDisposable(installVscodeShimPackage(this._initData, (url: string) => {
+\t\t\t\tif (!apiModuleFactory) {
+\t\t\t\t\tapiModuleFactory = this._factories.get('vscode');
+\t\t\t\t\tassertType(apiModuleFactory);
+\t\t\t\t}
+\t\t\t\tconst apiInstance = apiModuleFactory.load('_not_used', URI.parse(url), () => { throw new Error('CANNOT LOAD MODULE from here.'); });
+\t\t\t\tlet key = apiInstances.get(apiInstance);
+\t\t\t\tif (!key) {
+\t\t\t\t\tkey = generateUuid();
+\t\t\t\t\tapiInstances.set(apiInstance, key);
+\t\t\t\t}
+\t\t\t\treturn apiInstance;
+\t\t\t})));
+\t\t\treturn;
+\t\t}
+
+\t\tconst hooks = nodeModule.registerHooks({`],
+
+  // The helper is kept as a real .txt file rather than inline: it is a lot of code, and
+  // inlining it here means escaping it twice (JS template literal, then TypeScript).
+  [`export class ExtHostExtensionService extends AbstractExtHostExtensionService {`,
+   `${fs.readFileSync(require('node:path').join(process.env['VSHELL_LIB_DIR'], 'extHostExtensionService.shim.ts.txt'), 'utf8')}export class ExtHostExtensionService extends AbstractExtHostExtensionService {`],
+]);
+
 // Extension gallery: Open VSX, not the Microsoft marketplace.
 //
 // Without an `extensionsGallery`, build/lib/builtInExtensions.ts falls back to
@@ -365,7 +447,7 @@ patch('src/vs/base/node/id.ts', [
 BUNPATCH
 
 echo "==> configuring VS Code checkout for bun (${VDIR})"
-bun "${PATCHER}"
+VSHELL_LIB_DIR="${SHELL_REPO}/scripts/lib" bun "${PATCHER}"
 
 # --- Codebun backend extension -----------------------------------------------
 #

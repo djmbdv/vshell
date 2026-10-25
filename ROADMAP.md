@@ -215,13 +215,14 @@ Status after the first spike (`scripts/build_reh.sh`, 2026-10-25):
       build without that native killed the server with an unhandled rejection
       before it served anything. Patched in `configure_vscode_for_bun.sh`; worth
       reporting upstream.
-- [ ] Build the natives. `scripts/build_reh.sh --natives` drives `node-gyp` **on Bun**
+- [x] Build the natives. `scripts/build_reh.sh --natives` drives `node-gyp` **on Bun**
       (pinned as a devDependency; npm and Node are not involved, which also matters
-      because `bunx node-gyp` on Windows silently re-executes `node.exe`). It stops
-      with node-gyp's own diagnosis: the VS 2026 Build Tools here report
-      `found VC++ toolset: v145` but **`missing any Windows SDK`**, and MSBuild then
-      fails with **MSB8040** (Spectre-mitigated libs). So the missing pieces are VS
-      components, not code: the Windows SDK + the Spectre CRT libs.
+      because `bunx node-gyp` on Windows silently re-executes `node.exe`). It first
+      stopped with node-gyp's own diagnosis — `missing any Windows SDK` plus **MSB8040**
+      (the `binding.gyp` files ask for Spectre-mitigated libs) — so the missing pieces
+      were VS components, not code. With the Windows SDK and the Spectre CRT libs
+      installed, all five addons build (`node-pty/conpty.node`, `spdlog.node`,
+      `windows.node`, `winregistry.node`, …) and **load in Bun**.
 - [x] Verify the extension host process actually spawns under Bun when a client
       connects. **It does**, once the socket survives: `[ExtensionHostConnection] New
       connection established`, `Launched Extension Host Process`, and the child (a
@@ -235,16 +236,32 @@ Status after the first spike (`scripts/build_reh.sh`, 2026-10-25):
       (`web/proxy.js`, `--reh`). It also forwards `x-forwarded-host`, because the REH
       derives the workbench's `remoteAuthority` from it — without that header the page
       sends the client straight to the REH and the socket breaks again.
+- [x] Activate a real Node extension — the point of the whole route. Two Bun gaps had
+      to be closed first, and both failed silently (no error anywhere the shell could
+      see), which is why this took instrumentation rather than debugging:
+      - **The transport.** `child.send(msg, socket)` reaches the child as a message
+        with `hasHandle: false`: Bun carries fork IPC messages and drops the socket
+        handle. The extension host waited for its socket, hit the 60 s timeout and
+        exited with code 0 having activated nothing. VS Code's other transport — a
+        named pipe the child connects to itself — works, because Bun's `node:net`
+        supports Windows named pipes; `configure_vscode_for_bun.sh` selects it under
+        Bun. (Corollary for the item below: what Bun cannot listen on is a named pipe
+        through `node:http`, not through `node:net`.)
+      - **`require('vscode')`.** The interceptor uses `module.registerHooks` (absent in
+        Bun) or a `module._load` patch (ignored by Bun), so every extension threw
+        `MODULE_NOT_FOUND` at its first line. The host now writes a real `vscode`
+        package into each extensions root and hands the requiring file name back via a
+        global, keeping the API instance per extension.
+      Measured with ESLint 3.0.34 in `.work/reh-data/extensions`: the probe logs
+      `module-load` **and** `activate`, from `bun.exe`, `versions.bun = 1.4.3`.
+- [ ] Windows **named pipes** for `node:http`: the agent host gives up after five
+      restarts with `ENOENT: no such file or directory, listen '\\.\pipe\vscode-ipc-…'`.
+      Narrower than it first looked — `net.createServer().listen('\\\\.\\pipe\\x')`
+      works in Bun, so this is specifically the HTTP server's pipe listener.
 - [ ] Terminal through the REH (`ptyHost` child under Bun + `node-pty`). The addon is
       built and loads in Bun, but the pty host has not been exercised yet.
 - [ ] Build `@vscode/sqlite3` as well: the agent host logs
       `Cannot find module '../build/Release/vscode-sqlite3.node'` and falls back.
-- [ ] Windows **named pipes**: the agent host gives up after five restarts with
-      `ENOENT: no such file or directory, listen '\\.\pipe\vscode-ipc-…'`. The
-      extension host is unaffected (it uses stdio), but the agent host is not, so this
-      is a Bun gap to check or work around.
-- [ ] Activate a real Node extension (Python, ESLint) — the point of the whole route,
-      and the next thing to prove now that the host is up.
 - [ ] Judge case by case whether it stays on Bun. **Plan B is an embedded Node
       server, and activating it breaks "everything on Bun" — decide that
       explicitly, never by drift.**

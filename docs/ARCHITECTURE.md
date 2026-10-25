@@ -260,7 +260,40 @@ inside the engine's update callback deadlocks**.
   except the pixels. Menu commands are dispatched from `pump()`, never from the
   `WM_COMMAND` handler, because `run_menu_command` evaluates JS.
 
-## 6. Licensing and risks
+## 6. The extension host on Bun
+
+The REH route (`ROADMAP.md`, Phase 2b) inherits VS Code's own Node-half services, so
+the only interesting question is whether its extension host can run on Bun. It can,
+but two Bun gaps sit exactly on the path and both fail **silently** — they produce no
+error the shell can see, only an extension host that does nothing.
+
+- **The transport.** The server hands its socket to the forked child with
+  `child.send(msg, socket)`. Bun carries the *message* and drops the *handle*:
+  instrumenting the child showed
+  `ipc message: {"type":"VSCODE_EXTHOST_IPC_SOCKET", "hasHandle":false}`. The child then
+  waits for `VSCODE_EXTHOST_IPC_SOCKET` for 60 s and exits with code 0, having
+  activated nothing. VS Code has a second transport for exactly this case — listen on a
+  named pipe and let the child connect — and Bun's `node:net` speaks Windows named
+  pipes (`net.createServer().listen('\\\\.\\pipe\\x')` works; what does *not* is
+  `node:http` listening on one). So `configure_vscode_for_bun.sh` flips
+  `_canSendSocket` off under Bun and the pipe transport takes over.
+- **`require('vscode')`.** The interceptor resolves the API module with
+  `module.registerHooks` (Node 22) or by patching `module._load`. Bun has neither:
+  `registerHooks` is `undefined` and a `_load` patch is never consulted, so every
+  `require('vscode')` in every extension throws `MODULE_NOT_FOUND`. What every runtime
+  does honour is ordinary `node_modules` resolution, so the extension host writes a
+  real `vscode` package into `<each extensions root>/node_modules/vscode/`; it hands
+  `module.parent.filename` back through a global, which preserves the per-extension API
+  instance the hooks used to provide. Built-in extensions are consumed as CommonJS
+  (`typescript-language-features/dist/extension.js` has 89 `require("vscode")`), which
+  is what the generated package serves.
+
+Verification is a file, not a log, because the extension host's output goes to the
+client: a probe extension that appends to `.work/node-probe.log` on module load and
+again on activation now writes both lines, with
+`execPath = bun.exe` and `versions.bun = 1.4.3`.
+
+## 7. Licensing and risks
 
 - **WebKit (WinCairo), the current engine**: LGPL-2.1 + BSD upstream, **no commercial
   edition**, and it is *upstream* — security fixes flow from WebKit directly. Keep
