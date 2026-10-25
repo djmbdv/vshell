@@ -32,6 +32,10 @@ mut:
 	// so the workbench opens the folder without a reload.
 	folder      string
 	open_folder bool
+	// url points the window at a server this process did NOT start (an
+	// already-running `vscode-reh-web`, a remote workspace, a static host). When
+	// set, no Bun child is spawned and --port/--web-root are ignored.
+	url         string
 	// evals are JS snippets run in the page once it is live (a way to poke the
 	// bridge from the CLI without any UI).
 	evals       []string
@@ -86,21 +90,27 @@ fn run() !int {
 		}
 	}
 
-	mut server := start_web_server(serve_script, opts.web_root, opts.port)!
+	mut server := WebServer{}
+	if opts.url == '' {
+		server = start_web_server(serve_script, opts.web_root, opts.port)!
+		println('vshell: web server pid=${server.pid} port=${server.port}')
+
+		// The view must not load before Bun accepts connections, or the host page
+		// 404s and the workbench never mounts.
+		if !server.wait_until_listening(10_000) {
+			return error('the web server never started listening on port ${opts.port}')
+		}
+	} else {
+		// Nothing to wait for: --url means somebody else owns the server.
+		println('vshell: loading ${opts.url} (no server started)')
+	}
 	defer {
 		server.stop()
-	}
-	println('vshell: web server pid=${server.pid} port=${server.port}')
-
-	// The view must not load before Bun accepts connections, or the host page
-	// 404s and the workbench never mounts.
-	if !server.wait_until_listening(10_000) {
-		return error('the web server never started listening on port ${opts.port}')
 	}
 
 	mut eng := engine.new_engine(opts.engine_kind)!
 	eng.set_bootstrap(token, folder)
-	url := 'http://127.0.0.1:${opts.port}/'
+	url := if opts.url != '' { opts.url } else { 'http://127.0.0.1:${opts.port}/' }
 	eng.create_window('vshell', url, 1280, 800, opts.dev_mode)!
 
 	// The shell's own chrome: a real Win32 menu bar, drawn and owned by the OS.
@@ -237,6 +247,14 @@ fn parse_args(args []string) Options {	mut opts := Options{}
 			'--open-folder' {
 				opts.open_folder = true
 				i++
+			}
+			'--url' {
+				if i + 1 < args.len {
+					opts.url = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
 			}
 			'--eval' {
 				if i + 1 < args.len {

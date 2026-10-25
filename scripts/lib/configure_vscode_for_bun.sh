@@ -297,6 +297,29 @@ patch('build/next/index.ts', [
   }
 }
 
+// The REH (`server-web`) starts on Windows only if @vscode/windows-registry can
+// be imported, and that module is a NATIVE addon. In a checkout where natives are
+// not built (any web-only build), the import rejects; from outside the try block
+// that rejection is an unhandled promise rejection and takes the whole server down
+// before it serves a request. Moving the import inside the try turns "the server
+// cannot start" into "no SQM machine id", which is what the surrounding code
+// already handles. Reported upstream-worthy; the fix is one line.
+patch('src/vs/base/node/id.ts', [
+  [`\tif (isWindows) {
+\t\tconst Registry = await import('@vscode/windows-registry');
+\t\ttry {
+\t\t\treturn Registry.GetStringRegKey('HKEY_LOCAL_MACHINE', SQM_KEY, 'MachineId') || '';
+\t\t} catch (err) {`,
+   `\tif (isWindows) {
+\t\t// vshell: the import has to be inside the try. @vscode/windows-registry is
+\t\t// native, and where it is not built the import rejects; outside the try that
+\t\t// is an unhandled rejection that kills the REH before it serves anything.
+\t\ttry {
+\t\t\tconst Registry = await import('@vscode/windows-registry');
+\t\t\treturn Registry.GetStringRegKey('HKEY_LOCAL_MACHINE', SQM_KEY, 'MachineId') || '';
+\t\t} catch (err) {`],
+]);
+
 // Extension gallery: Open VSX, not the Microsoft marketplace.
 //
 // Without an `extensionsGallery`, build/lib/builtInExtensions.ts falls back to

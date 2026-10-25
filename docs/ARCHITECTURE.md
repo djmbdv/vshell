@@ -91,6 +91,14 @@ web route must not depend on that outcome.
 An earlier version of this section described `vscode-reh-web` as *the* backend. It is
 the second route, not the first.
 
+**First spike (2026-10-25):** the second route is much closer than the table suggests.
+`bun build/next/index.ts bundle --target server-web` runs unchanged, the server boots
+on Bun (`Web UI available`, `Extension host agent started`), and our WebKit window
+renders the workbench it serves. What the web build cannot do — real `file:`, PTY,
+search, watch, Node extensions — is *already written* in the Node half; the REH just
+needs that half to run. The remaining work is build-side (native addons) and one
+upstream bug, not engine-side. `scripts/build_reh.sh` reproduces the whole thing.
+
 ### 3.2 Opening a folder: never through the URL
 
 `vscode.openFolder` looks like the obvious way to implement "Open Folder" inside the

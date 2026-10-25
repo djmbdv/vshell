@@ -110,6 +110,7 @@ sh scripts/run.sh -- --port 9000 --web-root web/public
 | `--eval '<js>'` | evaluate JS once the page is live (repeatable) |
 | `--open-folder` | ask for the workspace with the shell's **native** folder dialog before the window opens (what `scripts/run.sh` does by default) |
 | `--folder <path>` | open that folder directly, no dialog |
+| `--url <url>` | load a server this process does **not** start (an already-running `vscode-reh-web`, a remote workspace, any static host). `--port`/`--web-root` are then ignored |
 
 ### JS ↔ V bridge
 

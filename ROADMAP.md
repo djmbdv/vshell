@@ -193,10 +193,36 @@ Only if the web-extension route proves too narrow. The deciding factor is the
 **extension ecosystem**: Python, C++, ESLint and friends need an extension host that
 can run Node code.
 
-- [ ] Build `vscode-reh-web-<plat>-<arch>` alongside `vscode-web`.
-- [ ] Start the REH with **Bun** (not Node) and verify the web ↔ reh handshake.
-- [ ] Inventory the natives against **Bun's N-API**: `@vscode/ripgrep`, `spdlog`,
-      keytar, sqlite. (`node-pty` is already replaced by `bun-pty` in Phase 2.)
+Status after the first spike (`scripts/build_reh.sh`, 2026-10-25):
+
+- [x] Build `vscode-reh-web-<plat>-<arch>` alongside `vscode-web`:
+      `bun build/next/index.ts bundle --target server-web` works unchanged, and
+      `scripts/build_reh.sh` assembles the layout the server expects
+      (`out/` + `node_modules/` + `extensions/`). The flat bundle on its own serves
+      the host page and 404s every asset — measured.
+- [x] Start the REH with **Bun** (not Node): it binds, prints
+      `Web UI available at http://localhost:8137` and `Extension host agent started`,
+      and serves the workbench (`workbench.js`, 37 MB, 200). Our own WebKit window
+      then loads it: `document.title` → `Welcome - Code - OSS`,
+      `.monaco-workbench` → 1. So the missing piece was never the engine.
+- [x] Inventory the natives against **Bun's N-API**: Bun loads N-API addons
+      (verified with a prebuilt `.node`), and `node-pty` 1.2.0-beta.15 is
+      `node-addon-api` (N-API), so the pty host is no longer the blocker it was
+      when it was NAN-based. `spdlog`, `@vscode/deviceid` and
+      `@vscode/windows-registry` are N-API as well.
+- [x] Fixed an upstream robustness bug found on the way: `src/vs/base/node/id.ts`
+      imported `@vscode/windows-registry` **outside** its `try`, so any Windows
+      build without that native killed the server with an unhandled rejection
+      before it served anything. Patched in `configure_vscode_for_bun.sh`; worth
+      reporting upstream.
+- [ ] Build the natives. `npm rebuild @vscode/spdlog` fails here with **MSB8040**:
+      the VS 2026 Build Tools install lacks the Spectre-mitigated CRT libs. spdlog
+      itself is optional (its import is guarded), but `deviceid`/`windows-registry`
+      are needed for telemetry/identity and `node-pty` for the terminal.
+- [ ] Verify the extension host process actually spawns under Bun when a client
+      connects (the WS handshake is accepted; a per-window ext host was not observed
+      yet, which is expected without the auth/initialize exchange).
+- [ ] Terminal through the REH (`ptyHost` child under Bun + `node-pty`).
 - [ ] Judge case by case whether it stays on Bun. **Plan B is an embedded Node
       server, and activating it breaks "everything on Bun" — decide that
       explicitly, never by drift.**
