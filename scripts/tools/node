@@ -1,0 +1,7 @@
+#!/bin/sh
+# vshell: `node` for build tools only, forwarded to Bun.
+#
+# The MSYS/Git-bash side of the shim (node.cmd is the cmd.exe one): gyp spawns its
+# commands through the shell it was started from, and from Git bash that means this
+# script. See node.cmd for why this exists at all.
+exec bun "$@"

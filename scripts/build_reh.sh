@@ -39,6 +39,17 @@ fi
 
 cd "$(dirname "$0")/.."
 HERE="$(pwd)"
+
+# Bun is the ONLY JavaScript interpreter in this project, including at build time.
+# These two lines are what enforces it: nothing below can reach a system Node even if
+# one is installed, and the `node` that third-party binding.gyp files call is the Bun
+# shim in scripts/tools (Bun implements -p/-e, which is all gyp wants).
+PATH="${HERE}/scripts/tools:${HERE}/node_modules/.bin:${PATH}"
+export PATH
+if [ "${VSHELL_ALLOW_NODE:-0}" != "1" ]; then
+	export PATH="$(printf '%s' "${PATH}" | tr ':' '\n' | grep -vi 'nodejs' | paste -sd ':' -)"
+fi
+
 VS="${HERE}/.work/vscode"
 REH="${HERE}/.work/reh"
 DATA="${HERE}/.work/reh-data"

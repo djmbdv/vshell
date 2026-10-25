@@ -34,8 +34,8 @@ vshell (V, built with mingw-w64)
 |---|---|---|
 | **V 0.5.2** | builds the shell | `setup/install_v.ps1` |
 | **MSYS2 + gcc (ucrt64)** | links the C binding | `setup/install_toolchain.ps1` |
-| **Bun** | builds/serves the web artifact **and** runs the backend service; `bun install` in the repo root pulls `bun-pty` (terminal) and `node-gyp` (compile driver for the REH's native addons) | [bun.sh](https://bun.sh) |
-| **VS Build Tools** *(only to build the REH's natives)* | `node-gyp` compiles `node-pty`, `spdlog`, `deviceid`, `windows-registry` with it: needs **Desktop development with C++**, a **Windows SDK** and the **Spectre-mitigated libs**. Node and npm are **not** needed — `node-gyp` itself runs on Bun (`bun node_modules/node-gyp/bin/node-gyp.js`) | [VS installer](https://visualstudio.microsoft.com/downloads/) |
+| **Bun** | **the only JavaScript interpreter in the project** — builds and serves the web artifact, runs the backend service, *and* stands in for `node` at build time (`scripts/tools/node`, because some third-party `binding.gyp` files shell out to `node -p`). Also installs `node-gyp` as the compile driver for the REH's native addons | [bun.sh](https://bun.sh) |
+| **VS Build Tools** *(only to build the REH's natives)* | `node-gyp` compiles `node-pty`, `spdlog`, `deviceid`, `windows-registry`, `sqlite3` with it: needs **Desktop development with C++**, a **Windows SDK** and the **Spectre-mitigated libs**. No Node, no npm | [VS installer](https://visualstudio.microsoft.com/downloads/) |
 | **WebKit (WinCairo), Windows x64** | the engine | `perl Tools/Scripts/build-webkit --release` in a `WebKit/WebKit` checkout, then stage it (below). There is no SDK to download. |
 | *Optional:* Ultralight SDK 2.0.0-beta.2 (free, win-x64) | only to re-enable the archived backend: `mv engine/ultralight.v.disabled engine/ultralight.v` and restore its branch in `new_engine()` | download and extract into `.work/ul-sdk` |
 
@@ -233,6 +233,17 @@ docking a second panel and copying `inspector/` into `assets/inspector/`.
 
 - **No V8.** The renderer is WebKit (the WinCairo port, JavaScriptCore) and Bun also
   uses JSC: a single engine family across the whole stack.
+- **No Node either, and that is enforced.** Bun is the only JavaScript interpreter in
+  the project, at runtime *and* at build time. The two places Node used to leak in are
+  closed: `node-gyp` is invoked as `bun node_modules/node-gyp/bin/node-gyp.js` (it
+  reports `using node@26.x` because Bun emulates `process.versions`), and the few
+  third-party `binding.gyp` files that shell out to `node -p "require(…)"` are answered
+  by `scripts/tools/node`, a two-line shim that forwards to Bun. `build_reh.sh` also
+  removes any `nodejs` directory from `PATH`, so a system Node cannot be picked up even
+  by accident (`VSHELL_ALLOW_NODE=1` opts out). Verified by deleting a built addon and
+  rebuilding it with Node off the path.
+  The addons themselves are N-API: compiled once against the N-API headers, loaded by
+  Bun, no Node runtime involved.
 - **`vscode` is not a submodule.** It is consumed as a *build input*: cloned at a
   pinned SHA into `.work/vscode`, patched, and the web assets are built from it.
   The tree is regenerated, never edited.
