@@ -757,18 +757,20 @@ fn (mut e WebKitEngine) pump() {
 	if e.page_ready && e.pending.len > 0 {
 		e.eval_ticks++
 		// readyState completes on the bare host page, long before the workbench
-		// exists (the host page's <body> is empty and it sets no <title>), so the
-		// CLI evals wait for a page that has both content and a title of its own.
-		// For this shell that moment is "the workbench mounted", which is what
-		// `--eval 'document.title'` is supposed to observe. `eval_ticks` is the
-		// escape hatch for a page that never sets a title.
+		// exists, so the CLI evals wait for a page that has both content and a title
+		// of its own. For this shell that moment is "the workbench mounted", which is
+		// what `--eval 'document.title'` is supposed to observe. A page without a
+		// title would never satisfy it (--url can point at any page now), so time is
+		// also an escape hatch: 4 s after the body appeared, run them anyway.
 		//
 		// The probe returns a STRING on purpose: eval_js only converts WKString
 		// results (wk_type_to_utf8), so a bare boolean or `.length` would come
 		// back as '' and the check could never pass — it would silently fall
 		// through to the tick cap, which is what made `--eval` look like it did
 		// nothing for a minute.
-		body := e.eval_js('document.body && document.body.innerHTML.length > 0 && document.title ? "1" : "0"') or { '0' }
+		body := e.eval_js('document.body && document.body.innerHTML.length > 0 && (document.title || ' +
+			'((window.__vshellEvalDeadline = window.__vshellEvalDeadline || Date.now() + 4000) && Date.now() > window.__vshellEvalDeadline)' +
+			') ? "1" : "0"') or { '0' }
 		if body.int() > 0 || e.eval_ticks > 1200 {
 			for script in e.pending {
 				if rv := e.eval_js_checked(script) {
