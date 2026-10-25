@@ -9,6 +9,7 @@
 import { join } from 'node:path'
 
 import { handleBackend, websocket, UPGRADED } from './backend.js'
+import { handleProxyUpgrade, isUpgrade, proxyRequest, proxyWebsocket, UPGRADED as PROXY_UPGRADED } from './proxy.js'
 
 const argv = process.argv.slice(2)
 const opt = (name, def) => {
@@ -20,6 +21,10 @@ const port = Number(opt('port', process.env.VSHELL_PORT ?? '8123'))
 const host = opt('host', process.env.VSHELL_HOST ?? '127.0.0.1')
 const root = opt('root', process.env.VSHELL_WEB_ROOT ?? join(import.meta.dir, 'public'))
 const base = root.replace(/[\\/]+$/, '')
+// When set (`--upstream`, or `--reh` from the shell), this server becomes the origin:
+// everything that is not ours is forwarded to a vscode-reh-web. See web/proxy.js for
+// why the shell terminates the WebSocket instead of letting the REH do it.
+const upstream = opt('upstream', process.env.VSHELL_UPSTREAM ?? '')
 // VSHELL_ACCESS_LOG=1 logs every request: handy to watch the embedded engine
 // load the workbench (the V shell inherits the env and passes it to this child).
 const accessLog = process.env.VSHELL_ACCESS_LOG === '1'
@@ -111,14 +116,25 @@ const server = Bun.serve({
   hostname: host,
   port,
   // The terminal (web/backend.js) tunnels a PTY over a WebSocket, so the server
-  // needs the handlers; the upgrade itself is decided in the fetch below.
-  websocket,
+  // needs the handlers; the upgrade itself is decided in the fetch below. In proxy
+  // mode the only socket is the remote agent's, and it is piped to the REH.
+  websocket: upstream ? proxyWebsocket : websocket,
   async fetch(req) {
     const url = new URL(req.url)
     // Collapse repeated slashes: the template computes its file root as
     // `new URL(<base>, origin) + '/out/'`, which yields '//out/...'.
     const pathname = decodeURIComponent(url.pathname).replace(/\/{2,}/g, '/')
     if (accessLog) console.log(`vshell-web: ${req.method} ${pathname}`)
+
+    if (upstream) {
+      // Proxy mode: this process is the origin for the workbench the REH serves.
+      if (isUpgrade(req)) {
+        const r = handleProxyUpgrade(req, url, server, upstream)
+        if (r === PROXY_UPGRADED) return undefined
+        return r
+      }
+      return proxyRequest(req, url, upstream)
+    }
 
     // The Codebun backend (filesystem, terminal). Mounted before the static
     // handling so no file named like a route can shadow it. See web/backend.js.
@@ -159,4 +175,5 @@ const server = Bun.serve({
 })
 
 console.log(`vshell-web: root=${base}`)
+if (upstream) console.log(`vshell-web: proxying to ${upstream}`)
 console.log(`vshell-web: listening on http://${host}:${server.port}/`)

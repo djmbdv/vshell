@@ -16,13 +16,16 @@ mut:
 }
 
 // start_web_server launches `bun run web/serve.js` and returns its PID.
-pub fn start_web_server(script string, root string, port int) !WebServer {
+// `extra` are passed through to the script (e.g. `--upstream <reh-url>`).
+pub fn start_web_server(script string, root string, port int, extra []string) !WebServer {
 	bun := find_executable('bun') or {
 		return error('bun not found in PATH (needed to serve the web build)')
 	}
 
 	mut p := os.new_process(bun)
-	p.set_args(['run', script, '--port', port.str(), '--root', root])
+	mut args := ['run', script, '--port', port.str(), '--root', root]
+	args << extra
+	p.set_args(args)
 	p.run()
 
 	if !p.is_alive() {

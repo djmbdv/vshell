@@ -99,6 +99,15 @@ search, watch, Node extensions — is *already written* in the Node half; the RE
 needs that half to run. The remaining work is build-side (native addons) and one
 upstream bug, not engine-side. `scripts/build_reh.sh` reproduces the whole thing.
 
+**The one seam that had to be built (2026-10-25):** the REH's WebSocket server is
+VS Code's `ws` on `node:http`, and under Bun our WebKit never sees `open` — the
+handshake is completed server-side with a correct `101`, then the client dies with
+`1006` after ~10 s. WebKit ↔ `Bun.serve` works, and Bun as a *client* of the REH
+works, so the shell now owns the origin and pipes the socket (`web/proxy.js`,
+`--reh <url>`). That, plus forwarding `x-forwarded-host` (the source of the page's
+`remoteAuthority`), is what finally let the **remote extension host start on Bun**.
+It is a proxy, not a reimplementation: the protocol stays VS Code's.
+
 ### 3.2 Opening a folder: never through the URL
 
 `vscode.openFolder` looks like the obvious way to implement "Open Folder" inside the

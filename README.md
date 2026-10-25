@@ -111,7 +111,8 @@ sh scripts/run.sh -- --port 9000 --web-root web/public
 | `--eval '<js>'` | evaluate JS once the page is live (repeatable) |
 | `--open-folder` | ask for the workspace with the shell's **native** folder dialog before the window opens (what `scripts/run.sh` does by default) |
 | `--folder <path>` | open that folder directly, no dialog |
-| `--url <url>` | load a server this process does **not** start (an already-running `vscode-reh-web`, a remote workspace, any static host). `--port`/`--web-root` are then ignored |
+| `--url <url>` | load a server this process does **not** start (any static host). `--port`/`--web-root` are then ignored |
+| `--reh <url>` | load a `vscode-reh-web` **through the shell**: the Bun server becomes the origin and proxies to it, terminating the WebSocket itself (see *Remote extension host* below) |
 
 ### JS ↔ V bridge
 
@@ -173,6 +174,28 @@ those to VS Code commands (`MENU_COMMANDS` in `extensions/codebun-backend`), so
 adding a menu item for an existing workbench command costs no V change.
 
 API details, plus the origin and timing gotchas: `docs/ARCHITECTURE.md`.
+
+### Remote extension host (experimental)
+
+```sh
+sh scripts/build_reh.sh --natives   # once: the native addons (needs VS C++ + SDK + Spectre libs)
+sh scripts/build_reh.sh --run       # serves the REH on 127.0.0.1:8137
+bin/vshell.exe --reh http://127.0.0.1:8137/
+```
+
+`--reh` makes the shell the origin: its Bun server serves and proxies everything to
+the REH and **terminates the WebSocket itself**, piping messages to it. That is not
+decoration — measured: WebKit's `WebSocket` against the REH's own server (VS Code's
+`ws` on `node:http`, under Bun) completes the handshake, receives a valid `101`, and
+then never fires `open` (1006 after ~10 s). WebKit ↔ `Bun.serve` works, and Bun *as a
+client* of the REH works, so the proxy is the seam that sidesteps it.
+
+The proxy also forwards `x-forwarded-host`, which is where the REH builds the
+workbench's `remoteAuthority` from; without it the page would send the client
+straight to the REH and the socket would break again.
+
+Verified: the remote extension host starts on Bun (`Launched Extension Host Process`,
+exit code 0 on shutdown) with zero page errors.
 
 ## Layout
 

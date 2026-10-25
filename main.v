@@ -36,6 +36,10 @@ mut:
 	// already-running `vscode-reh-web`, a remote workspace, a static host). When
 	// set, no Bun child is spawned and --port/--web-root are ignored.
 	url         string
+	// reh is the base URL of a `vscode-reh-web` to proxy. The shell then owns the
+	// origin (serving everything and terminating the WebSocket) and forwards to it —
+	// the REH's own `node:http` upgrade does not survive under Bun with our WebKit.
+	reh         string
 	// evals are JS snippets run in the page once it is live (a way to poke the
 	// bridge from the CLI without any UI).
 	evals       []string
@@ -92,8 +96,12 @@ fn run() !int {
 
 	mut server := WebServer{}
 	if opts.url == '' {
-		server = start_web_server(serve_script, opts.web_root, opts.port)!
+		extra := if opts.reh != '' { ['--upstream', opts.reh] } else { []string{} }
+		server = start_web_server(serve_script, opts.web_root, opts.port, extra)!
 		println('vshell: web server pid=${server.pid} port=${server.port}')
+		if opts.reh != '' {
+			println('vshell: proxying to ${opts.reh}')
+		}
 
 		// The view must not load before Bun accepts connections, or the host page
 		// 404s and the workbench never mounts.
@@ -251,6 +259,14 @@ fn parse_args(args []string) Options {	mut opts := Options{}
 			'--url' {
 				if i + 1 < args.len {
 					opts.url = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--reh' {
+				if i + 1 < args.len {
+					opts.reh = args[i + 1]
 					i += 2
 				} else {
 					i++

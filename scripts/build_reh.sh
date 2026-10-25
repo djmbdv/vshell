@@ -53,7 +53,7 @@ fi
 # before this list existed. `node-pty` used to be the scary one and is N-API now
 # (1.2.0-beta.15); spdlog is optional (its import is guarded) but its absence
 # floods the log, and deviceid/windows-registry are imported by id.ts.
-NATIVES="node-pty @vscode/spdlog @vscode/deviceid @vscode/windows-registry"
+NATIVES="node-pty @vscode/spdlog @vscode/deviceid @vscode/windows-registry @vscode/sqlite3"
 
 # node-gyp runs under BUN, not Node and not npm: `bun node_modules/node-gyp/bin/
 # node-gyp.js` reports `using node@26.x` (Bun emulates process.versions) and does
