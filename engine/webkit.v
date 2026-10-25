@@ -50,10 +50,20 @@ fn C.wk_host_page(state voidptr) voidptr
 fn C.wk_host_view(state voidptr) voidptr
 fn C.wk_host_resize_view(state voidptr, width int, height int)
 fn C.wk_host_set_title(state voidptr, title &char)
+fn C.wk_host_enable_state_notifications(state voidptr) int
+fn C.wk_host_take_state_flags(state voidptr) int
 fn C.wk_host_wait(state voidptr, ms int)
 fn C.wk_host_pump_once(state voidptr) int
 fn C.wk_host_destroy(state voidptr)
 fn C.wk_host_pick_folder(parent voidptr) voidptr
+fn C.wk_host_menu_create() voidptr
+fn C.wk_host_menu_add_item(menu voidptr, id int, label &char)
+fn C.wk_host_menu_add_submenu(menu voidptr, label &char) voidptr
+fn C.wk_host_menu_add_separator(menu voidptr)
+fn C.wk_host_set_command_cb(state voidptr, cb WkMenuCb, ctx voidptr)
+fn C.wk_host_set_menu_bar(state voidptr, bar voidptr)
+fn C.wk_host_close_window(state voidptr)
+fn C.wk_host_message_box(state voidptr, title &char, text &char)
 
 fn C.wk_page_configuration_create() voidptr
 fn C.wk_page_configuration_set_user_content_controller(config voidptr, ucc voidptr)
@@ -69,6 +79,7 @@ fn C.wk_type_to_utf8(type_ref voidptr) voidptr
 fn C.wk_cstr_len(s voidptr) usize
 fn C.wk_page_copy_title(page voidptr) voidptr
 fn C.wk_page_copy_url(page voidptr) voidptr
+fn C.wk_page_reload(page voidptr)
 fn C.wk_host_free(p voidptr)
 
 fn C.wk_page_show_inspector(page voidptr, attached int) int
@@ -79,6 +90,20 @@ fn C.wk_release(ref voidptr)
 type WkCloseCb = fn (ctx voidptr)
 type WkMsgCb = fn (text &char, ctx voidptr)
 type WkEvalCb = fn (value voidptr, err_ref voidptr, ctx voidptr)
+type WkMenuCb = fn (id int, ctx voidptr)
+
+// First id the shell uses for its own menu items. Mirrors WK_MENU_ID_BASE in
+// engine/wk_host.h.
+const wk_menu_id_base = 40000
+
+// Mirrors WK_STATE_* in engine/wk_host.h: the bits wk_host_take_state_flags()
+// returns for page changes that arrived since the previous pump tick. There is
+// no loading bit on purpose: the C API reports that loading changed but has no
+// getter for the direction (see wk_host.h).
+const (
+	wk_state_title = 1
+	wk_state_url   = 2
+)
 
 // voidptr -> string. `vstring()` only exists on &char, not on a bare voidptr,
 // so this uses the same idiom as ultralight.v (vbytes + bytestr): the bytes are
@@ -141,6 +166,11 @@ const vshell_user_script_tail = '
 (function () {
 	var boot = { token: "%TOKEN%", folder: "%FOLDER%" };
 	window.__codebunBootstrap = boot;
+	// One dialog at a time, per request id. The extension re-sends its request
+	// every 250 ms until it gets a reply, because a BroadcastChannel has no replay
+	// and either side may have started late. Without this, every retry while the
+	// (modal!) folder dialog is open would queue another dialog.
+	var picking = {};
 	try {
 		var bc = new BroadcastChannel("codebun-bootstrap");
 		bc.onmessage = function (ev) {
@@ -149,10 +179,20 @@ const vshell_user_script_tail = '
 			if (d.type === "codebun:hello") {
 				bc.postMessage({ type: "codebun:bootstrap", token: boot.token, folder: boot.folder });
 			} else if (d.type === "codebun:pickFolder") {
+				if (picking[d.id]) return;
+				picking[d.id] = true;
 				window.vshell.dialog.openFolder().then(function (f) {
+					delete picking[d.id];
 					bc.postMessage({ type: "codebun:folderPicked", id: d.id, folder: f || "" });
 				});
 			}
+		};
+		// Native menu -> workbench. The shell owns the menu and forwards the
+		// commands it does not handle itself (see run_menu_command in webkit.v); the
+		// extension maps them to VS Code commands. Published as a global because the
+		// engine evaluates it from outside this closure.
+		window.__codebunMenu = function (command) {
+			try { bc.postMessage({ type: "codebun:menu", command: String(command) }); } catch (err) {}
 		};
 		bc.postMessage({ type: "codebun:bootstrap", token: boot.token, folder: boot.folder });
 	} catch (err) {}
@@ -264,11 +304,17 @@ mut:
 	eval_ticks int
 	pending    []string
 	closing    bool
-	// Window title sync. pump() runs every ~8 ms, and WKPageCopyTitle() is a
-	// synchronous call into the UI process, so poll sparsely and remember what we
-	// last showed to avoid redundant WM_SETTEXT messages.
-	title_ticks int
+	// Window title/URL sync. WebKit pushes changes through the page state client
+	// (wk_host_enable_state_notifications), so pump() only drains a bitmask and
+	// reads the values then -- but it still reads them with the Copy* getters, and
+	// `shown_*` keeps WM_SETTEXT from repeating on every tick.
+	state_flags int
 	shown_title string
+	shown_url   string
+	// Fallback for a build where the state client is unavailable: poll the title
+	// every `title_poll_ticks` ticks instead of waiting for a push.
+	poll_title  bool
+	title_ticks int
 	// Startup timing. Both marks reuse probes we already make, so measuring costs
 	// no extra IPC: `page_ready` is the existing readyState poll and the title is
 	// polled every ~250 ms anyway. They stay in the code because "why is the shell
@@ -281,15 +327,39 @@ mut:
 	// only meant for standalone development.
 	boot_token  string
 	boot_folder string
+
+	// Menu: Win32 gives items integer ids, so the shell's command strings are
+	// mapped through this table. `pending_menu` is what WM_COMMAND produced and
+	// pump() has not dispatched yet — a message handler must not run shell logic
+	// that evaluates JS, so it only records the command here.
+	menu_commands map[int]string
+	pending_menu  string
 }
 
-// pump() iterations between title polls (~30 x 8 ms = ~250 ms).
+// pump() iterations between title polls (~30 x 8 ms = ~250 ms). Only used when
+// the page state client is unavailable; with push events there is nothing to
+// poll.
 const title_poll_ticks = 30
+
+// What Help > About shows. A const so the text does not have to be a C literal
+// with hand-escaped newlines at the call site.
+const about_text = 'vshell - a V shell for the VS Code web build.\n\nRenderer: WebKit (WinCairo), JavaScriptCore\nServer: Bun, JavaScriptCore'
 
 // --- callbacks invoked from the C thunks ------------------------------------
 fn wk_on_close(ctx voidptr) {
 	mut e := unsafe { &WebKitEngine(ctx) }
 	e.closing = true
+}
+
+fn wk_on_menu(id int, ctx voidptr) {
+	mut e := unsafe { &WebKitEngine(ctx) }
+	// WM_COMMAND arrives inside wk_host_pump_once(), which may itself be running
+	// inside eval_js(). Recording a string is all that is safe here; pump() does
+	// the dispatch.
+	e.pending_menu = e.menu_commands[id] or { '' }
+	if e.pending_menu == '' {
+		eprintln('vshell: unknown menu id ${id}')
+	}
 }
 
 fn wk_on_message(text &char, ctx voidptr) {
@@ -347,6 +417,81 @@ fn (e WebKitEngine) build_user_script() string {
 	return vshell_user_script_head + tail
 }
 
+// --- menu -------------------------------------------------------------------
+
+// set_menu_bar builds the Win32 menu from the shell's items and installs it.
+// Call it after create_window(): the bar belongs to the frame the engine created,
+// and Windows destroys it with that window (so nothing here is freed by hand).
+pub fn (mut e WebKitEngine) set_menu_bar(items []MenuItem) bool {
+	if e.host == unsafe { nil } {
+		return false
+	}
+	bar := C.wk_host_menu_create()
+	if bar == unsafe { nil } {
+		return false
+	}
+	e.menu_commands = map[int]string{}
+	e.add_menu_items(bar, items, wk_menu_id_base)
+	C.wk_host_set_command_cb(e.host, wk_on_menu, voidptr(e))
+	C.wk_host_set_menu_bar(e.host, bar)
+	return true
+}
+
+// add_menu_items fills `menu` and returns the first id it did NOT use, so a
+// nested submenu can continue the numbering (V has no `mut` params for ints).
+fn (mut e WebKitEngine) add_menu_items(menu voidptr, items []MenuItem, start_id int) int {
+	mut next_id := start_id
+	for item in items {
+		if item.separator {
+			C.wk_host_menu_add_separator(menu)
+			continue
+		}
+		if item.children.len > 0 {
+			sub := C.wk_host_menu_add_submenu(menu, item.label.str)
+			if sub != unsafe { nil } {
+				next_id = e.add_menu_items(sub, item.children, next_id)
+			} else {
+				eprintln('vshell: could not add the submenu "${item.label}"')
+			}
+			continue
+		}
+		id := next_id
+		next_id++
+		e.menu_commands[id] = item.command
+		C.wk_host_menu_add_item(menu, id, item.label.str)
+	}
+	return next_id
+}
+
+// run_menu_command is the one place a chosen item turns into behaviour. Called
+// from pump(), never from the WM_COMMAND handler (see wk_on_menu).
+fn (mut e WebKitEngine) run_menu_command(command string) {
+	match command {
+		'app.quit' {
+			C.wk_host_close_window(e.host)
+		}
+		'view.reload' {
+			C.wk_page_reload(e.page)
+		}
+		'view.devtools' {
+			if !e.show_inspector(false) {
+				eprintln('vshell: this engine has no inspector')
+			}
+		}
+		'help.about' {
+			C.wk_host_message_box(e.host, c'About vshell', about_text.str)
+		}
+		else {
+			// Everything else belongs to the workbench: it is the side that knows
+			// what the command means (the extension listens for it on the
+			// bootstrap BroadcastChannel).
+			e.eval_js('window.__codebunMenu ? window.__codebunMenu(${json2.encode(command)}) : undefined') or {
+				eprintln('vshell: could not deliver the menu command "${command}": ${err}')
+			}
+		}
+	}
+}
+
 pub fn (mut e WebKitEngine) create_window(title string, url string, width int, height int, dev_mode bool) ! {
 	e.t0 = time.now()
 	e.title = title
@@ -385,6 +530,10 @@ pub fn (mut e WebKitEngine) create_window(title string, url string, width int, h
 	if e.page == unsafe { nil } {
 		return error('WKViewGetPage() returned NULL')
 	}
+
+	// Title/URL arrive as push events from here on. If this build of the engine
+	// cannot install the client, fall back to the sparse poll in pump().
+	e.poll_title = C.wk_host_enable_state_notifications(e.host) == 0
 
 	e.load_url(url)!
 }
@@ -505,6 +654,15 @@ fn (mut e WebKitEngine) pump() {
 		return
 	}
 
+	// A menu item chosen since the last tick. Dispatched here rather than in the
+	// WM_COMMAND handler because run_menu_command evaluates JS, and doing that
+	// from inside a Win32 callback re-enters the engine.
+	if e.pending_menu != '' {
+		command := e.pending_menu
+		e.pending_menu = ''
+		e.run_menu_command(command)
+	}
+
 	if !e.page_ready {
 		// `or` instead of if-optional: the body of the loop stays simple, and a
 		// timeout here does not need an else branch.
@@ -562,11 +720,20 @@ fn (mut e WebKitEngine) pump() {
 
 	// Keep the frame's title bar in sync with the page (the workbench sets
 	// document.title, so this is what makes the window say something useful
-	// instead of a fixed "vshell").
-	if e.title_ticks > 0 {
-		e.title_ticks--
-	} else {
-		e.title_ticks = title_poll_ticks
+	// instead of a fixed "vshell"). With the state client the change arrives as a
+	// push event; without it, poll every ~250 ms. Either way the value is read
+	// HERE, on the pump tick, never inside the WebKit callback.
+	flags := C.wk_host_take_state_flags(e.host)
+	mut title_dirty := flags & wk_state_title != 0
+	if e.poll_title {
+		if e.title_ticks > 0 {
+			e.title_ticks--
+		} else {
+			e.title_ticks = title_poll_ticks
+			title_dirty = true
+		}
+	}
+	if title_dirty {
 		t := e.page_title()
 		if t != '' && t != e.shown_title {
 			first := e.shown_title == ''
@@ -577,6 +744,16 @@ fn (mut e WebKitEngine) pump() {
 				// the "shell is actually usable" moment, not just "HTML arrived".
 				eprintln("vshell: workbench title set at ${time.since(e.t0).milliseconds()} ms -> '${t}'")
 			}
+		}
+	}
+	if flags & wk_state_url != 0 {
+		u := e.page_url()
+		if u != '' && u != e.shown_url {
+			// Logged on purpose: a page that silently reloads itself is the failure
+			// mode that cost the most time in Phase 2, and this is the cheapest
+			// signal that it is happening.
+			eprintln('vshell: url -> ${u}')
+			e.shown_url = u
 		}
 	}
 }

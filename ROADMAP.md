@@ -109,7 +109,29 @@ Inspector. Background: `docs/ARCHITECTURE.md` §2 and §5.
 - [x] Retired `engine/ultralight.v` and its branch in `new_engine()`. Done as
       `ultralight.v.disabled` rather than `git rm`, matching the existing
       `system_webview.v.disabled` convention, so it stays one `mv` away.
-- [ ] Resize/DPI, title/URL push events (`WKPageSetPageNavigationClient`), menus.
+- [x] Resize/DPI, title/URL push events, menus.
+      - **Resize:** the child `WKView` HWND is moved from `WM_SIZE`, sized from
+        `GetClientRect` (a minimized window reports 0×0 in `lParam`, and resizing
+        the view to zero makes WebKit throw its backing store away).
+      - **DPI:** the process is per-monitor-v2 aware, and `WM_DPICHANGED` applies
+        Windows' suggested rect, so dragging the window to a monitor with another
+        scale keeps the same visual size and re-lays the page out.
+      - **Title/URL:** pushed by `WKPageSetPageStateClient`, not polled. Polling
+        `WKPageCopyTitle` every 250 ms was one synchronous IPC round-trip per
+        tick; a poll remains only as a fallback if the client cannot be installed.
+        `url -> …` is logged on change, which is what makes a self-reloading page
+        visible instead of looking like a page that never finishes.
+      - **Menus:** a real Win32 menu bar built from `engine.MenuItem` (label +
+        command, no callbacks). The engine handles `app.quit`, `view.reload`,
+        `view.devtools` and `help.about`; everything else goes to the page as
+        `window.__codebunMenu(command)` and the extension maps it to a VS Code
+        command. Verified end to end by posting `WM_COMMAND` to the live window:
+        `view.reload` re-fetched the workbench, and `terminal.new` reached the
+        PTY (`vshell-web: terminal opened pid=…`).
+        ⚠️ Win32 detail that cost a build: the bar must come from `CreateMenu()`;
+        `CreatePopupMenu()` makes `SetMenu` fail with `ERROR_INVALID_PARAMETER`
+        (87) and the window silently gets no menu.
+- [ ] Tray icon, `vscode://` deep links and file associations (Phase 3).
 
 **Acceptance:** ✅ met. `sh scripts/run.sh` opens the workbench in our own Win32
 window with the WebKit engine, and the two probes answer on stdout:

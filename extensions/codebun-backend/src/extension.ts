@@ -323,6 +323,50 @@ async function pickFolderInShell(): Promise<{ folder: string } | undefined> {
 }
 
 /*
+ * Native menu commands from the shell.
+ *
+ * `main.v#build_menu` defines the menu bar and `engine/webkit.v#run_menu_command`
+ * handles the commands the shell itself owns (quit, reload, inspector, about).
+ * Anything else is forwarded to the page as `window.__codebunMenu(command)`,
+ * which re-broadcasts `{ type: "codebun:menu", command }` on the bootstrap
+ * channel; this is where that lands.
+ *
+ * The mapping lives here rather than in V on purpose: the shell does not need to
+ * know that "open a folder" in the workbench is `codebun.openFolder`, and adding
+ * a menu item for a new workbench command then costs no V change.
+ *
+ * Unlike the request/response helpers above, the channel is kept open for the
+ * whole session: it is waiting for events, not for a reply to a specific
+ * question, and closing it after the first message would work exactly once.
+ */
+const MENU_COMMANDS: Record<string, string> = {
+	'file.openFolder': 'codebun.openFolder',
+	'terminal.new': 'codebun.terminal.new',
+};
+
+function listenForMenuCommands(): vscode.Disposable {
+	const channel = openBootstrapChannel();
+	if (!channel) {
+		return new vscode.Disposable(() => { /* nothing to release */ });
+	}
+	channel.onmessage = (event: MessageEvent) => {
+		const data = event.data;
+		if (data?.type !== 'codebun:menu' || typeof data.command !== 'string') {
+			return;
+		}
+		const command = MENU_COMMANDS[data.command];
+		if (!command) {
+			console.warn(`codebun: the shell sent menu "${data.command}" and this build has no mapping for it`);
+			return;
+		}
+		void vscode.commands.executeCommand(command);
+	};
+	return new vscode.Disposable(() => {
+		try { channel.close(); } catch { /* already closed */ }
+	});
+}
+
+/*
  * The integrated terminal.
  *
  * A VS Code terminal is a Pseudoterminal plus a transport. The transport here is
@@ -448,6 +492,9 @@ export function activate(context: vscode.ExtensionContext): void {
 			pty: new CodebunPseudoterminal(workspaceFsPath()),
 		}).show();
 	}));
+
+	// The shell's native menu bar, for the items it does not handle itself.
+	context.subscriptions.push(listenForMenuCommands());
 
 	// Pick up the shell's session data and open the folder it chose, without a
 	// reload: the provider above is registered before this runs, so the folder

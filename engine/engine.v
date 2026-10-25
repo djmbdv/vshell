@@ -20,6 +20,11 @@ mut:
 	// HTTP response the page could be tricked into re-fetching. Both may be
 	// empty, which is the standalone/dev case.
 	set_bootstrap(token string, folder string)
+	// set_menu_bar installs the window's menu bar. The shell defines the items;
+	// the engine dispatches the command of whichever one is chosen, on the run
+	// loop (see MenuItem for who handles what). False when the engine has no
+	// native menus.
+	set_menu_bar(items []MenuItem) bool
 	// load_url navigates the current window.
 	load_url(url string) !
 	// run blocks until the last window is closed.
@@ -37,6 +42,32 @@ mut:
 	// show_inspector opens the engine's built-in inspector. `attached` docks it
 	// inside the page; false opens it in its own window. False when unsupported.
 	show_inspector(attached bool) bool
+}
+
+// MenuItem is one entry of the shell's menu bar, in the shell's own vocabulary.
+//
+// It carries a label and a command, never a callback: a callback into the shell
+// from inside a Win32 message handler would re-enter the engine, which is the one
+// thing this codebase never does (see the bridge notes in webkit.v).
+//
+// Command ownership is by convention, and the split is deliberate:
+//
+//   app.quit        the engine closes the window
+//   view.reload     the engine reloads the page
+//   view.devtools   the engine opens its inspector
+//   help.about      the engine shows a native message box
+//   anything else   forwarded to the workbench (`window.__codebunMenu`), because
+//                   only it knows what e.g. "open a folder" means
+pub struct MenuItem {
+pub:
+	label string
+	// command is what the item reports when chosen. Ignored for a submenu and a
+	// separator.
+	command string
+	// children, when non-empty, turn the item into a submenu.
+	children []MenuItem
+	// separator draws a line instead of a label.
+	separator bool
 }
 
 // new_engine returns an Engine implementation by name.

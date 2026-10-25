@@ -45,8 +45,23 @@ extension like this one. See `docs/ARCHITECTURE.md` §3.1 for the trade-off: thi
 route keeps everything on Bun but only runs **web** extensions, so Python, C++ or
 ESLint (Node extensions) stay out until Phase 2b.
 
-## Security
+## Native menu commands
 
+`main.v#build_menu` builds the shell's Win32 menu bar; the engine handles the four
+commands it owns (`app.quit`, `view.reload`, `view.devtools`, `help.about`) and
+forwards the rest to the page as `window.__codebunMenu(command)`. That lands here as
+`{ type: "codebun:menu", command }` on the bootstrap channel, and `MENU_COMMANDS`
+maps it to a VS Code command:
+
+| shell command | VS Code command |
+| --- | --- |
+| `file.openFolder` | `codebun.openFolder` |
+| `terminal.new` | `codebun.terminal.new` |
+
+Unlike the request/response helpers, this channel stays open for the whole session:
+it waits for events, not for a reply.
+
+## Security
 The Bun service listens on `127.0.0.1` and is gated by a **per-run token**, not only
 by `Origin`. The shell generates 256 random bits at startup (`main.v`, `new_token`),
 exports them as `VSHELL_TOKEN` before spawning the Bun child, and delivers them to

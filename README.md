@@ -22,6 +22,7 @@ vshell (V, built with mingw-w64)
 | Web build | ✅ `vscode-web` built on Bun, no node and no npm |
 | Workbench | ✅ boots inside the engine (themes, keybindings, extension host worker) |
 | JS ↔ V bridge | ✅ native `window.vshell` (frozen object) + `--eval` |
+| Native chrome | ✅ Win32 **menu bar** (File/View/Help) with a real command path into both the engine and the workbench; per-monitor DPI; title/URL **pushed** by WebKit instead of polled |
 | DevTools | ✅ real **Web Inspector** with the WebKit backend (`--devtools`) |
 | Backend (Phase 2) | ✅ our own: web extension (`extensions/codebun-backend`) + Bun service (`web/backend.js`) — folder picker, `codebun:` file system, and the integrated terminal (PTY over WebSocket, `bun-pty`). Workspace search and last-folder persistence are still open |
 | Next | workspace search, persisted last folder, then the shell's own UI (Phase 3 in the [ROADMAP](./ROADMAP.md)) |
@@ -144,18 +145,29 @@ await vshell.call('dialog.openFolder')         // -> absolute path, or '' if can
 window.__codebunBootstrap                      // { token, folder }  (out of band, not a URL)
 ```
 
+### Native menu
+
+`main.v#build_menu` declares the bar as `engine.MenuItem`s (label + command).
+`engine/webkit.v#run_menu_command` handles the four commands the shell owns
+(`app.quit`, `view.reload`, `view.devtools`, `help.about`) and forwards every
+other one to the page as `window.__codebunMenu(command)`, which re-broadcasts
+`{ type: "codebun:menu", command }` on the bootstrap channel. The extension maps
+those to VS Code commands (`MENU_COMMANDS` in `extensions/codebun-backend`), so
+adding a menu item for an existing workbench command costs no V change.
+
 API details, plus the origin and timing gotchas: `docs/ARCHITECTURE.md`.
 
 ## Layout
 
 ```
 vshell/
-├── main.v                     entrypoint: starts the server, opens the window, runs the loop
+├── main.v                     entrypoint: starts the server, opens the window, runs the loop;
+│                              build_menu() is the shell's menu bar
 ├── server.v                   launches and watches the Bun child process
 ├── engine/
-│   ├── engine.v               Engine interface (keeps the shell decoupled from the engine)
+│   ├── engine.v               Engine interface + MenuItem (keeps the shell engine-agnostic)
 │   ├── webkit.v               WebKit (WinCairo) backend + JS↔V bridge  ← the core
-│   ├── wk_host.h              C glue: the Win32 window + WKViewCreate (RECT by value)
+│   ├── wk_host.h              C glue: the Win32 window, DPI, menu bar, WKViewCreate
 │   └── ultralight.v           Ultralight binding (legacy backend)
 ├── web/
 │   ├── serve.js               Bun server; renders the workbench host page

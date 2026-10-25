@@ -69,6 +69,13 @@
 typedef void (*wk_close_cb)(void* ctx);
 typedef void (*wk_msg_cb)(char* text, void* ctx);
 typedef void (*wk_eval_cb)(void* value, void* error, void* ctx);
+/* A chosen menu item, identified by its id (see WK_MENU_ID_BASE). */
+typedef void (*wk_menu_cb)(int id, void* ctx);
+
+/* Menu ids start well above anything Windows or a dialog template hands us, so a
+ * WM_COMMAND for IDOK/IDCANCEL/IDYES and friends can never be mistaken for a
+ * menu command. Defined up here because wk_wndproc uses it. */
+#define WK_MENU_ID_BASE 40000
 
 /* -------------------------------------------------------------------------- */
 /* host state                                                                  */
@@ -83,6 +90,10 @@ typedef struct {
     void*       on_close_ctx;
     wk_msg_cb   on_message;
     void*       on_message_ctx;
+    wk_menu_cb  on_menu;
+    void*       on_menu_ctx;
+    int         state_flags;          /* WK_STATE_* bits not yet drained by V */
+    int         state_client_installed;
     int         quit;
 } wk_host_state;
 
@@ -99,13 +110,43 @@ static LRESULT CALLBACK wk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_SIZE:
         /* The child WKView does not resize itself: the whole point of a
-         * child-HWND model is that layout is the host's job. */
-        if (h && h->child)
-            MoveWindow(h->child, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+         * child-HWND model is that layout is the host's job.
+         *
+         * Read the client rect instead of LOWORD/HIWORD(lp): a minimized window
+         * reports 0x0 there, and resizing the view to zero makes WebKit tear down
+         * its backing store and repaint from scratch on restore. */
+        if (h && h->child) {
+            RECT rc;
+            if (GetClientRect(hwnd, &rc) && rc.right > 0 && rc.bottom > 0)
+                MoveWindow(h->child, 0, 0, rc.right, rc.bottom, TRUE);
+        }
+        return 0;
+    case WM_DPICHANGED:
+        /* The window moved to a monitor with a different scale factor. Windows
+         * hands over a suggested rect (physical pixels) that keeps the window the
+         * same *visual* size; apply it and let the WM_SIZE above resize the view.
+         * WebKit takes its own device scale factor from the same monitor, so the
+         * page re-lays out for the new DPI once the view has the new size. */
+        if (lp) {
+            const RECT* suggested = (const RECT*)lp;
+            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         return 0;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
+    case WM_COMMAND:
+        /* Only ids in the shell's own range are ours; everything else (a control
+         * notification, a system id) goes back to the default handler. */
+        if (h && HIWORD(wp) == 0 && LOWORD(wp) >= WK_MENU_ID_BASE) {
+            if (h->on_menu)
+                h->on_menu((int)LOWORD(wp), h->on_menu_ctx);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_DESTROY:
         /* DestroyWindow() destroys children first and then the parent, so by the
          * time this runs the WKView's HWND is already gone. Releasing the
@@ -278,6 +319,84 @@ static void* wk_host_attach_view(void* state, void* page_configuration, int widt
 static void* wk_host_page(void* state)   { return state ? (void*)((wk_host_state*)state)->page : NULL; }
 static void* wk_host_view(void* state)   { return state ? (void*)((wk_host_state*)state)->view : NULL; }
 
+/* Page state push notifications (title / URL).
+ *
+ * Push instead of polling: WKPageSetPageStateClient tells us when the page's
+ * title or active URL changed, so the run loop only reads them when they did.
+ * Before this, pump() called WKPageCopyTitle() every ~250 ms, and every one of
+ * those is a synchronous IPC round-trip to the UI process.
+ *
+ * WKPageNavigationClient is the newer client, but it carries *navigation* events
+ * (didCommit/didFinish) and no title or URL setters -- the state client is the
+ * one that does, and it is also what WebKit's own WinCairo MiniBrowser uses.
+ *
+ * Loading is deliberately NOT tracked here: the client reports didChangeIsLoading
+ * with no direction, and this C API has no WKPageIsLoading to ask which way it
+ * went (only WKPageGetEstimatedProgress, which is a progress value, not a state).
+ * Readiness stays a document.readyState poll in engine/webkit.v.
+ *
+ * The callbacks stay trivial on purpose. WebKit calls them on the UI-process
+ * thread while the page steps, and re-entering the engine from there (evaluating
+ * JS, showing a modal dialog) hangs -- the same rule the message handler follows.
+ * They only set a bit; V drains the mask on its next pump tick and reads the
+ * values there. */
+
+#define WK_STATE_TITLE 1
+#define WK_STATE_URL   2
+
+/* Returns and clears the pending bits, so a caller that drains per tick cannot
+ * miss a change that arrived between two reads. */
+static int wk_host_take_state_flags(void* state)
+{
+    wk_host_state* h = (wk_host_state*)state;
+    int flags;
+    if (!h)
+        return 0;
+    flags = h->state_flags;
+    h->state_flags = 0;
+    return flags;
+}
+
+static void wk_state_did_change_title(const void* clientInfo)
+{
+    wk_host_state* h = (wk_host_state*)clientInfo;
+    if (h)
+        h->state_flags |= WK_STATE_TITLE;
+}
+
+static void wk_state_did_change_url(const void* clientInfo)
+{
+    wk_host_state* h = (wk_host_state*)clientInfo;
+    if (h)
+        h->state_flags |= WK_STATE_URL;
+}
+
+/* One client per process, like the window. WebKit keeps the pointer, so this
+ * must outlive the page; a heap copy that V "owns" would be the easy mistake. */
+static WKPageStateClientV0 g_wk_state_client;
+
+/* Installs the push client on an attached page. Returns 1 when installed, so the
+ * caller can keep polling as a fallback if this API is unavailable. */
+static int wk_host_enable_state_notifications(void* state)
+{
+    wk_host_state* h = (wk_host_state*)state;
+    if (!h || !h->page)
+        return 0;
+    if (h->state_client_installed)
+        return 1;
+
+    h->state_client_installed = 1;
+
+    memset(&g_wk_state_client, 0, sizeof(g_wk_state_client));
+    g_wk_state_client.base.version = 0;
+    g_wk_state_client.base.clientInfo = h;
+    g_wk_state_client.didChangeTitle = wk_state_did_change_title;
+    g_wk_state_client.didChangeActiveURL = wk_state_did_change_url;
+
+    WKPageSetPageStateClient((WKPageRef)h->page, (WKPageStateClientBase*)&g_wk_state_client);
+    return 1;
+}
+
 /* Resize the embedded view (call from V if you resize the frame yourself). */
 static void wk_host_resize_view(void* state, int width, int height)
 {
@@ -413,6 +532,112 @@ static char* wk_host_pick_folder(void* parent)
 }
 
 /* -------------------------------------------------------------------------- */
+/* menu bar                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/* Builds the menu in V, one call per item. Labels are UTF-8 like every other
+ * string that crosses this header; `&` marks the mnemonic on Windows, and a
+ * literal `&` is `&&`.
+ *
+ * There is no accelerator table yet, so do NOT put "\tCtrl+O" in a label: it
+ * would advertise a shortcut that does nothing. */
+static void* wk_host_menu_create(void)
+{
+    /* CreateMenu (a menu BAR), not CreatePopupMenu: the bar is what SetMenu
+     * accepts, and the dropdowns hang off it as MF_POPUP submenus (see
+     * wk_host_menu_add_submenu). Passing a popup here failed with
+     * ERROR_INVALID_PARAMETER (87) from SetMenu -- measured, not assumed. */
+    return (void*)CreateMenu();
+}
+
+static void wk_host_menu_add_item(void* menu, int id, const char* label)
+{
+    wchar_t w[256];
+    if (!menu || !label || id < WK_MENU_ID_BASE)
+        return;
+    if (MultiByteToWideChar(CP_UTF8, 0, label, -1, w, 256) > 0)
+        AppendMenuW((HMENU)menu, MF_STRING, (UINT_PTR)id, w);
+}
+
+/* Appends a submenu and returns it, so the caller can fill it in. */
+static void* wk_host_menu_add_submenu(void* menu, const char* label)
+{
+    HMENU sub;
+    wchar_t w[256];
+    if (!menu || !label)
+        return NULL;
+    sub = CreatePopupMenu();
+    if (!sub)
+        return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, label, -1, w, 256) <= 0
+        || !AppendMenuW((HMENU)menu, MF_POPUP, (UINT_PTR)sub, w)) {
+        DestroyMenu(sub);
+        return NULL;
+    }
+    return (void*)sub;
+}
+
+static void wk_host_menu_add_separator(void* menu)
+{
+    if (menu)
+        AppendMenuW((HMENU)menu, MF_SEPARATOR, 0, NULL);
+}
+
+/* Dispatches chosen items to V. Installed with wk_host_set_command_cb. */
+static void wk_host_set_command_cb(void* state, wk_menu_cb cb, void* ctx)
+{
+    wk_host_state* h = (wk_host_state*)state;
+    if (!h)
+        return;
+    h->on_menu = cb;
+    h->on_menu_ctx = ctx;
+}
+
+/* Installs `bar` as the frame's menu bar. The window owns the handle from here
+ * on: Windows destroys the menu with the window, so it is created per run and
+ * never freed by hand (DestroyMenu on a live menu bar is the classic leak/crash
+ * pair).
+ *
+ * A failure here is silent by nature — the window simply has no menu — so it is
+ * reported. It has already earned its keep once: SetMenu returned FALSE with
+ * ERROR_INVALID_PARAMETER (87) for every item because `bar` was built with
+ * CreatePopupMenu, and nothing else in the program noticed. */
+static void wk_host_set_menu_bar(void* state, void* bar)
+{
+    wk_host_state* h = (wk_host_state*)state;
+    if (!h || !h->hwnd || !bar)
+        return;
+    if (!SetMenu(h->hwnd, (HMENU)bar))
+        fprintf(stderr, "vshell: SetMenu failed (err=%d)\n", (int)GetLastError());
+    DrawMenuBar(h->hwnd);
+}
+
+/* Asks the window to close (WM_CLOSE), which is the same path the title bar's X
+ * takes, so there is one shutdown sequence and not two. */
+static void wk_host_close_window(void* state)
+{
+    wk_host_state* h = (wk_host_state*)state;
+    if (h && h->hwnd)
+        PostMessageW(h->hwnd, WM_CLOSE, 0, 0);
+}
+
+/* A modal message box owned by the frame: the shell's first native dialog that
+ * does not need COM. */
+static void wk_host_message_box(void* state, const char* title, const char* text)
+{
+    wk_host_state* h = (wk_host_state*)state;
+    wchar_t wtitle[256];
+    wchar_t wtext[1024];
+    if (!title || !text)
+        return;
+    if (MultiByteToWideChar(CP_UTF8, 0, title, -1, wtitle, 256) <= 0)
+        return;
+    if (MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, 1024) <= 0)
+        return;
+    MessageBoxW(h ? h->hwnd : NULL, wtext, wtitle, MB_OK | MB_ICONINFORMATION);
+}
+
+/* -------------------------------------------------------------------------- */
 /* page / configuration / bridge                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -515,6 +740,14 @@ static void wk_page_eval(void* page, const char* script, wk_eval_cb cb, void* ct
                                         WKStringCreateWithUTF8CString(script),
                                         ctx,
                                         (WKPageEvaluateJavaScriptFunction)cb);
+}
+
+/* WKPageReload is the in-place reload; the 5 variants that also take a "from
+ * origin"/"stop first" meaning are not needed here. */
+static void wk_page_reload(void* page)
+{
+    if (page)
+        WKPageReload((WKPageRef)page);
 }
 
 static char* wk_type_to_utf8(void* type)

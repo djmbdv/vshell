@@ -103,6 +103,13 @@ fn run() !int {
 	url := 'http://127.0.0.1:${opts.port}/'
 	eng.create_window('vshell', url, 1280, 800, opts.dev_mode)!
 
+	// The shell's own chrome: a real Win32 menu bar, drawn and owned by the OS.
+	// The engine dispatches what it can handle itself (quit, reload, inspector,
+	// about) and forwards the rest to the workbench (see engine.MenuItem).
+	if !eng.set_menu_bar(build_menu()) {
+		println('vshell: this engine has no native menu bar')
+	}
+
 	if folder != '' {
 		println('vshell: folder ${folder}')
 	}
@@ -132,8 +139,62 @@ fn run() !int {
 	return 0
 }
 
-fn parse_args(args []string) Options {
-	mut opts := Options{}
+// build_menu is the shell's chrome, written in the shell's vocabulary: a label
+// and a command per item, never a callback. Which side handles a command is
+// documented on engine.MenuItem — the short version is that the engine owns
+// quit/reload/inspector/about and everything else goes to the workbench, which
+// maps it to a VS Code command (extensions/codebun-backend).
+//
+// The `&` is the Win32 mnemonic (Alt+F). There is no accelerator table yet, so no
+// item advertises a shortcut it does not have.
+fn build_menu() []engine.MenuItem {
+	return [
+		engine.MenuItem{
+			label:    '&File'
+			children: [
+				engine.MenuItem{
+					label:   'Open Folder...'
+					command: 'file.openFolder'
+				},
+				engine.MenuItem{
+					label:   'New Terminal'
+					command: 'terminal.new'
+				},
+				engine.MenuItem{
+					separator: true
+				},
+				engine.MenuItem{
+					label:   'Exit'
+					command: 'app.quit'
+				},
+			]
+		},
+		engine.MenuItem{
+			label:    '&View'
+			children: [
+				engine.MenuItem{
+					label:   'Reload'
+					command: 'view.reload'
+				},
+				engine.MenuItem{
+					label:   'Web Inspector'
+					command: 'view.devtools'
+				},
+			]
+		},
+		engine.MenuItem{
+			label:    '&Help'
+			children: [
+				engine.MenuItem{
+					label:   'About vshell'
+					command: 'help.about'
+				},
+			]
+		},
+	]
+}
+
+fn parse_args(args []string) Options {	mut opts := Options{}
 	mut i := 1
 	for i < args.len {
 		match args[i] {

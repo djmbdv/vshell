@@ -217,6 +217,22 @@ inside the engine's update callback deadlocks**.
   plain `PeekMessage`/`TranslateMessage`/`DispatchMessage` pump that idles on
   `MsgWaitForMultipleObjectsEx` (~0% CPU). `pump()` still runs from V between messages.
 
+- **Page state is pushed, not polled.** `WKPageSetPageStateClient` (version 0) reports
+  `didChangeTitle` / `didChangeActiveURL`; the callbacks only set a bit in the host
+  state and V reads the values on its next pump tick. Two reasons it is done this way:
+  reading `WKPageCopyTitle` on a timer is a synchronous IPC round-trip per poll, and
+  calling *anything* into WebKit from inside a client callback re-enters the UI process
+  (the same trap as the message handler).
+  Note this C client has no equivalent of `WKPageIsLoading`, so "the document is
+  ready" stays a `document.readyState` poll; `didChangeIsLoading` cannot be turned
+  into a state because no getter exposes which way it changed.
+
+- **The menu bar is `CreateMenu()`, not `CreatePopupMenu()`.** `SetMenu` rejects a
+  popup handle with `ERROR_INVALID_PARAMETER` (87) and the window silently ends up
+  without a menu — measured, after the first version looked correct in every way
+  except the pixels. Menu commands are dispatched from `pump()`, never from the
+  `WM_COMMAND` handler, because `run_menu_command` evaluates JS.
+
 ## 6. Licensing and risks
 
 - **WebKit (WinCairo), the current engine**: LGPL-2.1 + BSD upstream, **no commercial
