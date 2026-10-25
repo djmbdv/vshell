@@ -257,12 +257,25 @@ fn parse_args(args []string) Options {	mut opts := Options{}
 				}
 			}
 			'--eval' {
-				if i + 1 < args.len {
-					opts.evals << args[i + 1]
-					i += 2
-				} else {
-					i++
+				// Take EVERY following token that is not another flag. On Windows the
+				// command line splits on spaces, so `--eval 'typeof window.x'` arrives as
+				// ["typeof", "window.x"] and quietly evaluating just "typeof" produced a
+				// blank answer with no hint of why — three debugging sessions in a row.
+				// Joining until the next flag makes the unquoted form work; a properly
+				// quoted script is a single token and is unaffected.
+				mut script := ''
+				mut j := i + 1
+				for j < args.len && !args[j].starts_with('--') {
+					if script != '' {
+						script += ' '
+					}
+					script += args[j]
+					j++
 				}
+				if script != '' {
+					opts.evals << script
+				}
+				i = j
 			}
 			else {
 				i++

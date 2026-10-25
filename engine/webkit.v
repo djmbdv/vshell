@@ -129,6 +129,11 @@ fn wk_cstr(p voidptr) string {
 // the folder it opened, which are per-run. See build_user_script().
 const vshell_user_script_head = '
 (function () {
+	// Idempotent: the shell injects this twice on purpose — as a WKUserScript at
+	// document start, and again by evaluation after the load, because a page with a
+	// strict Content-Security-Policy (vscode-reh-web sends one) blocks the inline
+	// injection and would otherwise leave the page with no bridge at all.
+	if (window.vshell) { return; }
 	var pending = {}, seq = 0;
 	window.vshell = Object.freeze({
 		version: "vshell-bridge-wk",
@@ -164,6 +169,23 @@ const vshell_user_script_head = '
 // host worker (which has no `window`) gets it. See extensions/codebun-backend.
 const vshell_user_script_tail = '
 (function () {
+	if (window.__codebunBootstrap) { return; }
+	// Last-resort diagnostics for the shell: the engine has no console hook in the
+	// C API (console messages need an injected bundle), so errors are collected here
+	// and read back with --eval and JSON.stringify(window.__codebunErrors). A page
+	// that renders but silently fails to do something (the remote connection, for
+	// one) is otherwise indistinguishable from a working one. No quote characters in
+	// this comment: it lives inside a V single-quoted string literal.
+	window.__codebunErrors = [];
+	window.addEventListener("error", function (e) {
+		try { window.__codebunErrors.push("error: " + (e.message || e.error || e)); } catch (err) {}
+	});
+	window.addEventListener("unhandledrejection", function (e) {
+		try {
+			var r = e && e.reason;
+			window.__codebunErrors.push("rejection: " + ((r && (r.stack || r.message)) || String(r)));
+		} catch (err) {}
+	});
 	var boot = { token: "%TOKEN%", folder: "%FOLDER%" };
 	window.__codebunBootstrap = boot;
 	// One dialog at a time, per request id. The extension re-sends its request
@@ -334,6 +356,11 @@ mut:
 	// that evaluates JS, so it only records the command here.
 	menu_commands map[int]string
 	pending_menu  string
+	// bridge_injected tracks the by-evaluation injection for the current document.
+	// The WKUserScript covers the common case, but a page with a strict CSP
+	// (vscode-reh-web) blocks inline user scripts, so the pump injects again after
+	// the load; the script itself is idempotent. Reset on every navigation.
+	bridge_injected bool
 }
 
 // pump() iterations between title polls (~30 x 8 ms = ~250 ms). Only used when
@@ -417,7 +444,16 @@ fn (e WebKitEngine) build_user_script() string {
 	tail := vshell_user_script_tail
 		.replace('%TOKEN%', escape_for_js_string(e.boot_token))
 		.replace('%FOLDER%', escape_for_js_string(e.boot_folder))
-	return vshell_user_script_head + tail
+	script := vshell_user_script_head + tail
+	// A truncated bridge fails SILENTLY — the page simply has no `window.vshell`,
+	// and the only symptom is every call answering undefined. That happened once:
+	// a comment inside one of the string literals above contained two single quotes,
+	// which ended the V string early and dropped the rest of the script on the
+	// floor, with no compile error. The shape is cheap to assert.
+	if !script.trim_space().ends_with('})();') {
+		eprintln('vshell: WARNING injected bridge script looks truncated (len=${script.len}); check for a stray quote in engine/webkit.v')
+	}
+	return script
 }
 
 // --- menu -------------------------------------------------------------------
@@ -700,6 +736,24 @@ fn (mut e WebKitEngine) pump() {
 			eprintln('vshell: page ready (document.readyState) at ${time.since(e.t0).milliseconds()} ms')
 		}
 	}
+	// Second chance for the bridge. A page served with a strict CSP blocks the
+	// document-start user script (the injection is inline and carries no nonce), so
+	// the page would come up with no `window.vshell`, no bootstrap and no error
+	// collector — which is exactly what vscode-reh-web did. Evaluating the same
+	// script is not subject to CSP. The script returns early if it already ran, so
+	// the normal case pays one cheap call and nothing else.
+	//
+	// This runs BEFORE the queued evals below on purpose: those are the user's
+	// `--eval` scripts and they should be able to see the bridge.
+	if e.page_ready && !e.bridge_injected {
+		e.bridge_injected = true
+		if res := e.eval_js(e.build_user_script()) {
+			_ := res
+		} else {
+			eprintln('vshell: bridge injection failed: ${err}')
+			e.bridge_injected = false
+		}
+	}
 	if e.page_ready && e.pending.len > 0 {
 		e.eval_ticks++
 		// readyState completes on the bare host page, long before the workbench
@@ -786,6 +840,8 @@ fn (mut e WebKitEngine) pump() {
 			// signal that it is happening.
 			eprintln('vshell: url -> ${u}')
 			e.shown_url = u
+			// New document: the by-evaluation injection has to happen again.
+			e.bridge_injected = false
 		}
 	}
 }
