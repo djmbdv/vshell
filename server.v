@@ -4,7 +4,8 @@ import net
 import os
 import time
 
-// WebServer is the Bun process that serves `vscode-web` to the embedded view.
+// WebServer is the Bun process that serves the shell's origin: the static root,
+// the upstream proxy, and the embedder's `--backend` plugin.
 // The shell launches it as a child and owns its lifetime: without stop() the
 // server outlives the shell and keeps the port busy.
 pub struct WebServer {
@@ -16,10 +17,11 @@ mut:
 }
 
 // start_web_server launches `bun run web/serve.js` and returns its PID.
-// `extra` are passed through to the script (e.g. `--upstream <reh-url>`).
+// `extra` are passed through to the script (`--upstream <url>`, `--no-cache`,
+// `--backend <file>`).
 pub fn start_web_server(script string, root string, port int, extra []string) !WebServer {
 	bun := find_executable('bun') or {
-		return error('bun not found in PATH (needed to serve the web build)')
+		return error('bun not found in PATH (needed to run web/serve.js)')
 	}
 
 	mut p := os.new_process(bun)
@@ -51,10 +53,10 @@ pub fn (mut s WebServer) stop() {
 }
 
 // start_child launches an arbitrary process the shell owns. It exists for
-// `--reh-run`: the REH is a second Bun server (and it in turn starts the
-// extension host, the pty host and file watchers), so having the shell start it
-// inside its job object is what makes "close the window, everything is gone"
-// true for the whole tree instead of only for the proxy.
+// `--run`: an application server is very often not one process (a web IDE starts
+// its extension host, its pty host and its file watchers), so having the shell
+// start it inside its job object is what makes "close the window, everything is
+// gone" true for the whole tree and not only for the proxy.
 pub fn start_child(exe string, args []string) !WebServer {
 	mut p := os.new_process(exe)
 	p.set_args(args)

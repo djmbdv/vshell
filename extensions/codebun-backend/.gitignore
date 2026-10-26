@@ -1,4 +1,0 @@
-# build output: scripts/build_web.sh bundles the web target inside the VS Code
-# checkout, which is disposable, so nothing here is a source of truth
-dist/
-out/

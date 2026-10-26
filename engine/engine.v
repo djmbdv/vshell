@@ -14,12 +14,14 @@ mut:
 	// create_window opens the top-level window pointing at `url`. dev_mode turns
 	// on the engine's developer diagnostics (and is needed for the inspector).
 	create_window(title string, url string, width int, height int, dev_mode bool) !
-	// set_bootstrap hands the page the shell's session data — the backend token
-	// and the folder the user opened — before it loads. Out-of-band by design:
+	// set_host hands the page the shell's host payload before it loads: an opaque
+	// JSON object the embedder defines (empty is fine, and is the standalone case).
+	// The shell does not interpret it; it only guarantees delivery, out of band —
 	// the WebKit backend injects it as a user script, never through a URL or an
-	// HTTP response the page could be tricked into re-fetching. Both may be
-	// empty, which is the standalone/dev case.
-	set_bootstrap(token string, folder string)
+	// HTTP response the page could be tricked into re-fetching.
+	// `scripts` are file paths whose contents run in the page after the bridge,
+	// each wrapped so one cannot break the rest (the preload-script slot).
+	set_host(payload_json string, scripts []string)
 	// set_menu_bar installs the window's menu bar. The shell defines the items;
 	// the engine dispatches the command of whichever one is chosen, on the run
 	// loop (see MenuItem for who handles what). False when the engine has no
@@ -56,8 +58,9 @@ mut:
 //   view.reload     the engine reloads the page
 //   view.devtools   the engine opens its inspector
 //   help.about      the engine shows a native message box
-//   anything else   forwarded to the workbench (`window.__codebunMenu`), because
-//                   only it knows what e.g. "open a folder" means
+//   anything else   forwarded to the page as a `menu` event (window.vshell.on),
+//                   because only the embedder knows what e.g. "open a folder"
+//                   means. The shell deliberately has no idea.
 pub struct MenuItem {
 pub:
 	label string

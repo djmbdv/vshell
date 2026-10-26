@@ -1,6 +1,6 @@
 Module {
 	name: 'vshell'
-	description: 'V-native desktop shell for the VS Code web build (WebKit/WinCairo + Bun server, no V8)'
+	description: 'Desktop shell in V on WebKit/WinCairo with a Bun origin: an Electron alternative, no V8 and no Node'
 	version: '0.0.1'
 	license: 'MIT'
 }

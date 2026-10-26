@@ -1,76 +1,117 @@
 module main
 
 import os
-import rand
+import json2
 import engine
 
 // vshell entrypoint.
 //
+// The shell is an Electron alternative, nothing more: it owns a window with a
+// real engine inside, a local HTTP server that can also act as the origin of an
+// upstream it proxies (HTTP and WebSocket), and the lifetime of whatever it
+// starts. It knows nothing about what the page *is*.
+//
+// Everything application-specific enters through data:
+//   --inject   an opaque JSON payload the page reads as window.vshell.host
+//   --script   extra JS injected by the embedder, before the page's own code
+//   --menu     the native menu bar, as JSON
+//   --run      the upstream program to launch (an app server, a dev server...)
+//
 // Flow:
-//   1. start the Bun web server (serves the vscode-web build)
-//   2. wait until it is actually listening
-//   3. open the engine window pointing at http://127.0.0.1:<port>/
-//   4. run the engine loop
-//   5. tear everything down on exit (including the Bun child)
+//   1. put the process job in place (nothing the shell starts may outlive it)
+//   2. optionally start the upstream (--run) and wait for it
+//   3. start the server that serves the static root and/or proxies the upstream
+//   4. open the window, hand the page its payload, install the menu
+//   5. run the engine loop, then tear everything down
 //
 // See ROADMAP.md. Phases 0/1 were validated on the Ultralight backend, which
-// Phase 1b replaced: the workbench now boots inside WebKit (the WinCairo port),
-// same JavaScriptCore family, no V8 anywhere.
+// Phase 1b replaced: the page now boots inside WebKit (the WinCairo port), same
+// JavaScriptCore family, no V8 anywhere.
 
 const default_port = 8123
-const default_web_root = 'web/public'
 const serve_script = 'web/serve.js'
+
+// shell_root is the directory the shell was shipped in (the one holding web/ and
+// bin/). Everything the shell starts must not depend on the working directory:
+// an embedder points the cwd at its own tree so its children inherit it, and
+// `bun run web/serve.js` would then fail with ENOENT.
+fn shell_root() string {
+	exe_dir := os.dir(os.executable())
+	if os.exists(os.join_path(exe_dir, serve_script)) {
+		return exe_dir
+	}
+	if os.exists(os.join_path(exe_dir, '..', serve_script)) {
+		return os.join_path(exe_dir, '..')
+	}
+	return os.getwd()
+}
+
+// serve_script_path is the shell's web server: the working directory first
+// (running from the repo root), then the layout next to the executable.
+fn serve_script_path() string {
+	if os.exists(serve_script) {
+		return serve_script
+	}
+	return os.join_path(shell_root(), serve_script)
+}
+
+// default_web_root is what --serve falls back to: the tree the shell ships next
+// to itself, or the working directory when there is none. It only matters when
+// no upstream answers, because the proxy is consulted before the static root.
+fn default_web_root() string {
+	shipped := os.join_path(shell_root(), 'web', 'public')
+	if os.exists(shipped) {
+		return shipped
+	}
+	return '.'
+}
 
 struct Options {
 mut:
 	engine_kind string = 'webkit'
 	port        int    = default_port
-	web_root    string = default_web_root
+	// web_root is the directory the shell's server serves. It may be empty when
+	// the shell only fronts an upstream (--proxy): then every request is forwarded.
+	// Empty means "the tree the shell ships next to itself" (see default_web_root).
+	web_root    string
 	dev_mode    bool
-	// folder is the workspace to open. --folder sets it directly; --open-folder
-	// asks the OS for it with the native dialog. Both feed the page bootstrap,
-	// so the workbench opens the folder without a reload.
-	folder      string
-	open_folder bool
-	// url points the window at a server this process did NOT start (an
-	// already-running `vscode-reh-web`, a remote workspace, a static host). When
-	// set, no Bun child is spawned and --port/--web-root are ignored.
+	// url points the window at a server this process did NOT start. When set, no
+	// server and no upstream are spawned and --port/--web-root are ignored.
 	url         string
-	// reh is the base URL of a `vscode-reh-web` to proxy. The shell then owns the
-	// origin (serving everything and terminating the WebSocket) and forwards to it —
-	// the REH's own `node:http` upgrade does not survive under Bun with our WebKit.
-	reh         string
-	// no_cache tells the proxy to answer `Cache-Control: no-store`. The REH marks its
-	// static tree with a one-year max-age and no validator, so after rebuilding the
-	// workbench the browser keeps running the old bundle and every change looks like
+	// proxy is the base URL of an upstream the shell fronts: it becomes the origin
+	// (serving everything and terminating the WebSocket) and forwards to it. The
+	// indirection exists because not every upstream's own WebSocket upgrade
+	// survives every engine; see web/proxy.js for the measurement.
+	proxy       string
+	// run_cmd/run_args launch that upstream as a child, inside the shell's job
+	// object, so closing (or killing) the shell takes the whole tree with it.
+	run_cmd     string
+	run_args    []string
+	// no_cache tells the proxy to answer Cache-Control: no-store. Long-lived
+	// caching of a build you are iterating on is how a rebuild ends up looking like
 	// it did nothing. Development flag; the default keeps the cache.
 	no_cache    bool
-	// reh_run is the directory of a built REH (the one `build_reh.sh` assembles).
-	// The shell starts it, proxies to it and — because the shell's job object holds
-	// the whole tree — takes the extension host, the pty host and the file watchers
-	// down with it when the window closes. This is what keeps repeated runs from
-	// leaving orphaned Bun processes behind.
-	reh_run  string
-	reh_port int = 8137
+	// backend is a JS module the shell's server loads as a plugin: it gets first
+	// refusal on every request, which is how an embedder mounts its own routes
+	// (rendered pages, APIs, WebSockets) without the shell knowing them. Its
+	// websocket handlers are what Bun.serve gets when set. See web/serve.js.
+	backend     string
+	// inject is the embedder's payload: inline JSON or @file. Delivered out of band
+	// (injected user script), never through a URL the page could be tricked into
+	// re-fetching.
+	inject      string
+	// scripts are JS files injected after the bridge, in order (repeatable).
+	scripts     []string
+	// menu_file is a JSON menu description (@file, path or inline). Empty means the
+	// shell's own three-item default.
+	menu_file   string
+	// folder/open_folder are a convenience for embedders whose payload wants a
+	// directory: the chosen path is merged into the payload as "folder".
+	folder      string
+	open_folder bool
 	// evals are JS snippets run in the page once it is live (a way to poke the
 	// bridge from the CLI without any UI).
 	evals       []string
-}
-
-// new_token returns a 256-bit session token as hex. It gates the Bun backend so
-// a process other than this shell cannot drive the file-system service (see
-// web/backend.js). rand.intn is used instead of a dedicated CSPRNG call so this
-// keeps working across V versions; 32 uniform bytes are well past enough for a
-// loopback token that only lives for one run.
-fn new_token() string {
-	hex_digits := '0123456789abcdef'
-	mut out := []u8{cap: 64}
-	for _ in 0 .. 32 {
-		n := rand.intn(256) or { 0 }
-		out << hex_digits[n >> 4]
-		out << hex_digits[n & 0xf]
-	}
-	return out.bytestr()
 }
 
 fn main() {
@@ -85,29 +126,24 @@ fn main() {
 
 fn run() !int {
 	mut opts := parse_args(os.args)
+	if opts.web_root == '' {
+		opts.web_root = default_web_root()
+	}
 
-	// The session token gates the Bun backend. The Bun child is spawned from this
-	// process (start_web_server), so it inherits the value through the
-	// environment; the page then receives it out-of-band, in the engine's user
-	// script (see set_bootstrap). It is never written to disk and never put in a
-	// URL.
-	token := new_token()
-	os.setenv('VSHELL_TOKEN', token, true)
-
-	// Pick the workspace before the window exists: the engine injects it into the
-	// page as a document-start user script, so it must be known up front. A
-	// native dialog with no owner still works, it is just not docked modally.
+	// Pick the folder before the window exists: the payload is injected as a
+	// document-start user script, so it must be known up front. A native dialog
+	// with no owner still works, it is just not docked modally.
 	mut folder := opts.folder
 	if folder == '' && opts.open_folder {
 		if chosen := engine.pick_folder() {
 			folder = chosen
 		} else {
-			println('vshell: no folder chosen (starting without a workspace)')
+			println('vshell: no folder chosen')
 		}
 	}
 
 	mut server := WebServer{}
-	mut reh_child := WebServer{}
+	mut upstream := WebServer{}
 	if opts.url == '' {
 		// Before any child exists: the job has to be in place to contain them, and it
 		// is what guarantees nothing survives the shell (see proc_job.v).
@@ -115,40 +151,43 @@ fn run() !int {
 			eprintln('vshell: could not create the job object; children may outlive the shell')
 		}
 
-		// --reh-run: start the REH ourselves so the job object owns it too. Without
-		// this the REH is something the user starts by hand, and a killed server
-		// leaves its extension host, pty hosts and file watchers running.
-		if opts.reh_run != '' {
-			reh_child = start_reh(opts.reh_run, opts.reh_port)!
-			if !process_job_assign(reh_child.pid) {
-				eprintln('vshell: could not put the REH in the job object')
+		if opts.run_cmd != '' {
+			upstream = start_child(opts.run_cmd, opts.run_args)!
+			if !process_job_assign(upstream.pid) {
+				eprintln('vshell: could not put the upstream in the job object')
 			}
-			opts.reh = 'http://127.0.0.1:${opts.reh_port}/'
+			println('vshell: upstream pid=${upstream.pid} (${opts.run_cmd})')
 		}
 
-		mut extra := if opts.reh != '' { ['--upstream', opts.reh] } else { []string{} }
+		mut extra := if opts.proxy != '' { ['--upstream', opts.proxy] } else { []string{} }
 		if opts.no_cache {
 			extra << '--no-cache'
 		}
-		server = start_web_server(serve_script, opts.web_root, opts.port, extra)!
+		if opts.backend != '' {
+			extra << '--backend'
+			extra << opts.backend
+		}
+		server = start_web_server(serve_script_path(), opts.web_root, opts.port, extra)!
 		if !process_job_assign(server.pid) {
 			eprintln('vshell: could not put the web server in the job object')
 		}
 		println('vshell: web server pid=${server.pid} port=${server.port}')
-		if opts.reh != '' {
-			println('vshell: proxying to ${opts.reh}')
+		if opts.proxy != '' {
+			println('vshell: proxying to ${opts.proxy}')
 		}
 
-		// The view must not load before Bun accepts connections, or the host page
-		// 404s and the workbench never mounts.
+		// The view must not load before the server accepts connections, or the host
+		// page 404s and nothing mounts.
 		if !server.wait_until_listening(10_000) {
 			return error('the web server never started listening on port ${opts.port}')
 		}
-		// Same for the REH: serving the shell's page while the upstream is still
-		// binding would hand the client a 502 and a blank workbench.
-		if opts.reh_run != '' {
-			if !WebServer{ port: opts.reh_port }.wait_until_listening(30_000) {
-				return error('the REH never started listening on port ${opts.reh_port}')
+		// Same for the upstream: serving the page while it is still binding would
+		// hand the client a 502 and an empty window.
+		if opts.run_cmd != '' && opts.proxy != '' {
+			if port := host_port_of(opts.proxy) {
+				if !WebServer{ port: port }.wait_until_listening(60_000) {
+					return error('the upstream never started listening on ${opts.proxy}')
+				}
 			}
 		}
 	} else {
@@ -157,18 +196,19 @@ fn run() !int {
 	}
 	defer {
 		server.stop()
-		reh_child.stop()
+		upstream.stop()
 	}
 
 	mut eng := engine.new_engine(opts.engine_kind)!
-	eng.set_bootstrap(token, folder)
+	eng.set_host(build_payload(opts.inject, folder), opts.scripts)
 	url := if opts.url != '' { opts.url } else { 'http://127.0.0.1:${opts.port}/' }
 	eng.create_window('vshell', url, 1280, 800, opts.dev_mode)!
 
 	// The shell's own chrome: a real Win32 menu bar, drawn and owned by the OS.
-	// The engine dispatches what it can handle itself (quit, reload, inspector,
-	// about) and forwards the rest to the workbench (see engine.MenuItem).
-	if !eng.set_menu_bar(build_menu()) {
+	// The engine handles the handful of commands that are its own (quit, reload,
+	// inspector, about) and forwards every other one to the page as a `menu`
+	// event, because only the embedder knows what "open a folder" means.
+	if !eng.set_menu_bar(load_menu(opts.menu_file)) {
 		println('vshell: this engine has no native menu bar')
 	}
 
@@ -201,91 +241,205 @@ fn run() !int {
 	return 0
 }
 
-// start_reh launches a built REH (`<dir>/out/server-main.js`) as a child of the
-// shell. It returns the process; the caller puts it in the job object, so the whole
-// tree — REH, extension host, pty host, file watchers — dies with the shell.
+// host_port_of extracts the port from a base URL (http://127.0.0.1:8137/). It
+// exists so --run knows what to wait for without the shell knowing what the
+// upstream is.
+fn host_port_of(url string) ?int {
+	scheme_end := url.index('://') or { return none }
+	rest := url[scheme_end + 3..]
+	host_port := rest.split('/')[0]
+	colon := host_port.last_index(':') or { return none }
+	return host_port[colon + 1..].int()
+}
+
+// build_payload returns the JSON object the page sees as window.vshell.host.
 //
-// The data directory follows what build_reh.sh assembles: the REH lives in
-// `<parent>/reh` and keeps its state in `<parent>/reh-data`, so a rebuilt layout
-// keeps its installed extensions and settings.
-fn start_reh(dir string, port int) !WebServer {
-	bun := find_executable('bun') or { return error('bun not found in PATH (needed to run the REH)') }
-	main_js := '${dir}/out/server-main.js'
-	if !os.exists(main_js) {
-		return error('no REH at ${main_js} (run scripts/build_reh.sh first)')
+// The base comes from --inject (inline JSON or @file) and the shell only adds
+// "folder" when one was chosen, because that is the one thing the shell can
+// produce itself. The merge is textual for a reason: the payload's shape is the
+// embedder's business, and round-tripping it through a decoder here would
+// silently drop every field this build does not know about.
+fn build_payload(inject string, folder string) string {
+	mut base := if inject == '' {
+		'{}'
+	} else if inject.starts_with('@') {
+		os.read_file(inject[1..]) or {
+			eprintln('vshell: could not read ${inject[1..]}: ${err}')
+			'{}'
+		}
+	} else {
+		inject
 	}
-	parent := os.dir(dir.trim_right('/\\'))
-	data := '${parent}/reh-data'
-	args := [
-		main_js,
-		'--port', port.str(),
-		'--host', '127.0.0.1',
-		'--without-connection-token',
-		'--accept-server-license-terms',
-		'--disable-telemetry',
-		'--user-data-dir', '${data}/data',
-		'--extensions-dir', '${data}/extensions',
-	]
-	println('vshell: starting REH ${main_js} on port ${port}')
-	return start_child(bun, args)
+	base = base.trim_space()
+	if base == '' {
+		base = '{}'
+	}
+	if folder == '' {
+		return base
+	}
+	entry := '"folder":"${json_escape(folder)}"'
+	if base == '{}' {
+		return '{${entry}}'
+	}
+	if !base.starts_with('{') {
+		eprintln('vshell: --inject is not a JSON object; ignoring it')
+		return '{${entry}}'
+	}
+	inner := base[1..].trim_left(' \t\r\n')
+	if inner == '}' {
+		return '{${entry}}'
+	}
+	return '{${entry},${inner}'
 }
 
-// build_menu is the shell's chrome, written in the shell's vocabulary: a label
-// and a command per item, never a callback. Which side handles a command is
-// documented on engine.MenuItem — the short version is that the engine owns
-// quit/reload/inspector/about and everything else goes to the workbench, which
-// maps it to a VS Code command (extensions/codebun-backend).
-//
-// The `&` is the Win32 mnemonic (Alt+F). There is no accelerator table yet, so no
-// item advertises a shortcut it does not have.
-fn build_menu() []engine.MenuItem {
-	return [
-		engine.MenuItem{
-			label:    '&File'
-			children: [
-				engine.MenuItem{
-					label:   'Open Folder...'
-					command: 'file.openFolder'
-				},
-				engine.MenuItem{
-					label:   'New Terminal'
-					command: 'terminal.new'
-				},
-				engine.MenuItem{
-					separator: true
-				},
-				engine.MenuItem{
-					label:   'Exit'
-					command: 'app.quit'
-				},
-			]
-		},
-		engine.MenuItem{
-			label:    '&View'
-			children: [
-				engine.MenuItem{
-					label:   'Reload'
-					command: 'view.reload'
-				},
-				engine.MenuItem{
-					label:   'Web Inspector'
-					command: 'view.devtools'
-				},
-			]
-		},
-		engine.MenuItem{
-			label:    '&Help'
-			children: [
-				engine.MenuItem{
-					label:   'About vshell'
-					command: 'help.about'
-				},
-			]
-		},
-	]
+// json_escape escapes a value for a JSON string literal. Paths are the reason it
+// exists: on Windows every one of them carries backslashes, which are illegal
+// unescaped in JSON.
+fn json_escape(s string) string {
+	mut out := []u8{cap: s.len + 8}
+	for c in s.bytes() {
+		match c {
+			34 {
+				out << u8(92)
+				out << u8(34)
+			}
+			92 {
+				out << u8(92)
+				out << u8(92)
+			}
+			10 {
+				out << u8(92)
+				out << u8(110)
+			}
+			13 {
+				out << u8(92)
+				out << u8(114)
+			}
+			9 {
+				out << u8(92)
+				out << u8(116)
+			}
+			else {
+				if c < 0x20 {
+					out << u8(92)
+					out << u8(117)
+					out << u8(48)
+					out << u8(48)
+					out << hex_digit(c >> 4)
+					out << hex_digit(c & 0xf)
+				} else {
+					out << c
+				}
+			}
+		}
+	}
+	return out.bytestr()
 }
 
-fn parse_args(args []string) Options {	mut opts := Options{}
+fn hex_digit(n u8) u8 {
+	return if n < 10 { u8(48) + n } else { u8(97) + (n - 10) }
+}
+
+// --- menu as data -----------------------------------------------------------
+
+// MenuItemSpec is one node of a --menu description. It mirrors engine.MenuItem,
+// which carries what the engine needs (a label and a command, never a callback):
+// a callback from inside a Win32 message handler would re-enter the engine.
+struct MenuItemSpec {
+	label     string
+	command   string
+	separator bool
+	items     []MenuItemSpec
+}
+
+struct MenuSpec {
+	menus []MenuItemSpec
+}
+
+// load_menu turns the --menu description into engine items. The argument may be
+// inline JSON, a path, or @path; empty returns the shell's own minimal bar, which
+// is deliberately about the shell and nothing else.
+fn load_menu(spec string) []engine.MenuItem {
+	if spec == '' {
+		return [
+			engine.MenuItem{
+				label:    '&File'
+				children: [
+					engine.MenuItem{
+						label:   'Exit'
+						command: 'app.quit'
+					},
+				]
+			},
+			engine.MenuItem{
+				label:    '&View'
+				children: [
+					engine.MenuItem{
+						label:   'Reload'
+						command: 'view.reload'
+					},
+					engine.MenuItem{
+						label:   'Developer Tools'
+						command: 'view.devtools'
+					},
+				]
+			},
+			engine.MenuItem{
+				label:    '&Help'
+				children: [
+					engine.MenuItem{
+						label:   'About vshell'
+						command: 'help.about'
+					},
+				]
+			},
+		]
+	}
+
+	raw := if spec.starts_with('@') {
+		os.read_file(spec[1..]) or {
+			eprintln('vshell: could not read menu ${spec[1..]}: ${err}')
+			return []
+		}
+	} else if spec.contains('{') {
+		spec
+	} else {
+		os.read_file(spec) or {
+			eprintln('vshell: could not read menu ${spec}: ${err}')
+			return []
+		}
+	}
+
+	decoded := json2.decode[MenuSpec](raw) or {
+		eprintln('vshell: invalid --menu JSON: ${err}')
+		return []
+	}
+	mut items := []engine.MenuItem{cap: decoded.menus.len}
+	for m in decoded.menus {
+		items << to_engine_menu(m)
+	}
+	return items
+}
+
+fn to_engine_menu(spec MenuItemSpec) engine.MenuItem {
+	mut children := []engine.MenuItem{cap: spec.items.len}
+	for child in spec.items {
+		children << to_engine_menu(child)
+	}
+	return engine.MenuItem{
+		label:     spec.label
+		command:   spec.command
+		separator: spec.separator
+		children:  children
+	}
+}
+// --- argument parsing -------------------------------------------------------
+
+// parse_args reads the CLI. The vocabulary is deliberately about the shell:
+// `--proxy` fronts an upstream, `--run` starts one, `--inject`/`--script`/`--menu`
+// hand the embedder's own data to the page. Nothing here names an application.
+fn parse_args(args []string) Options {
+	mut opts := Options{}
 	mut i := 1
 	for i < args.len {
 		match args[i] {
@@ -305,7 +459,7 @@ fn parse_args(args []string) Options {	mut opts := Options{}
 					i++
 				}
 			}
-			'--web-root' {
+			'--serve', '--web-root' {
 				if i + 1 < args.len {
 					opts.web_root = args[i + 1]
 					i += 2
@@ -316,6 +470,74 @@ fn parse_args(args []string) Options {	mut opts := Options{}
 			'--devtools' {
 				opts.dev_mode = true
 				i++
+			}
+			'--url' {
+				if i + 1 < args.len {
+					opts.url = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--proxy' {
+				if i + 1 < args.len {
+					opts.proxy = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--run' {
+				if i + 1 < args.len {
+					opts.run_cmd = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--run-arg' {
+				if i + 1 < args.len {
+					opts.run_args << args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--no-cache' {
+				opts.no_cache = true
+				i++
+			}
+			'--backend' {
+				if i + 1 < args.len {
+					opts.backend = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--inject' {
+				if i + 1 < args.len {
+					opts.inject = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--script' {
+				if i + 1 < args.len {
+					opts.scripts << args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
+			}
+			'--menu' {
+				if i + 1 < args.len {
+					opts.menu_file = args[i + 1]
+					i += 2
+				} else {
+					i++
+				}
 			}
 			'--folder' {
 				if i + 1 < args.len {
@@ -329,64 +551,27 @@ fn parse_args(args []string) Options {	mut opts := Options{}
 				opts.open_folder = true
 				i++
 			}
-			'--url' {
-				if i + 1 < args.len {
-					opts.url = args[i + 1]
-					i += 2
-				} else {
-					i++
-				}
-			}
-			'--reh' {
-				if i + 1 < args.len {
-					opts.reh = args[i + 1]
-					i += 2
-				} else {
-					i++
-				}
-			}
-			'--no-cache' {
-				opts.no_cache = true
-				i++
-			}
-			'--reh-run' {
-				if i + 1 < args.len {
-					opts.reh_run = args[i + 1]
-					i += 2
-				} else {
-					i++
-				}
-			}
-			'--reh-port' {
-				if i + 1 < args.len {
-					opts.reh_port = args[i + 1].int()
-					i += 2
-				} else {
-					i++
-				}
-			}
 			'--eval' {
 				// Take EVERY following token that is not another flag. On Windows the
 				// command line splits on spaces, so `--eval 'typeof window.x'` arrives as
 				// ["typeof", "window.x"] and quietly evaluating just "typeof" produced a
-				// blank answer with no hint of why — three debugging sessions in a row.
-				// Joining until the next flag makes the unquoted form work; a properly
-				// quoted script is a single token and is unaffected.
+				// blank answer with no hint of why. Joining until the next flag makes the
+				// unquoted form work; a properly quoted script is a single token.
 				mut script := ''
-				mut j := i + 1
-				for j < args.len && !args[j].starts_with('--') {
+				i++
+				for i < args.len && !args[i].starts_with('--') {
 					if script != '' {
 						script += ' '
 					}
-					script += args[j]
-					j++
+					script += args[i]
+					i++
 				}
 				if script != '' {
 					opts.evals << script
 				}
-				i = j
 			}
 			else {
+				eprintln('vshell: ignoring unknown argument ${args[i]}')
 				i++
 			}
 		}

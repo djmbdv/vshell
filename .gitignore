@@ -1,15 +1,7 @@
-# build inputs: the cloned vscode checkout and the produced web build
+# the WebKit staging and build scratch (engine headers, import lib, runtime DLLs)
 .work/
 
-# Bun packages for the web service (web/backend.js uses bun-pty). bun.lock IS
-# committed, so a fresh clone gets the same PTY build.
-node_modules/
-
-# generated web assets: the whole tree is produced by scripts/build_web.sh
-web/public/
-
-# build output: the shell binary, the Ultralight DLLs and the resources staged
-# next to it (~25 MB of icudt67l.dat lives under bin/assets/resources)
+# the shell binary and the runtime it is staged next to
 bin/
 
 # native artifacts

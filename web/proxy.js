@@ -1,19 +1,21 @@
 #!/usr/bin/env bun
-// Reverse proxy to a `vscode-reh-web` server, used when the shell is started with
-// `--reh <url>`.
+// Reverse proxy to an upstream server, used when the shell is started with
+// `--proxy <url>`.
 //
-// WHY THIS EXISTS — measured, not theoretical:
+// WHY THIS EXISTS — measured, not theoretical. The upstream we measured against was
+// a VS Code `vscode-reh-web` (the "REH" below), so it is named as such; the finding
+// is about the pair, not about VS Code:
 //
-// The REH's HTTP+WS server is VS Code's `ws` running on `node:http`. Under Bun that
+// The REH's HTTP+WS server is `ws` running on `node:http`. Under Bun that
 // layer completes the WebSocket handshake and sends a valid 101
 // (`Sec-WebSocket-Accept` verified byte for byte), but our WebKit never fires `open`
 // and the client dies with 1006 after ~10 s. The same page opens a socket to a
 // `Bun.serve` server instantly, and Bun *as a client* of the REH works too. So the
 // broken pair is exactly "WebKit <-> node:http upgrade on Bun".
 //
-// The fix is not to touch VS Code and not to reimplement its protocol: the shell
-// serves the origin and terminates the socket with `Bun.serve` (which works), then
-// pipes messages to the REH over a second WebSocket (which also works).
+// The fix is not to touch the upstream and not to reimplement its protocol: the
+// shell serves the origin and terminates the socket with `Bun.serve` (which works),
+// then pipes messages to the upstream over a second WebSocket (which also works).
 //
 // Messages are forwarded one by one, not frames: each side negotiates its own
 // extensions, so deflate/`x-webkit-deflate-frame` never crosses the boundary.

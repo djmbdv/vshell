@@ -1,14 +1,31 @@
 #!/usr/bin/env bun
-// vshell web server.
+// vshell web server: a static root, an optional upstream proxy, and a plugin
+// slot for the embedder. Launched by the V shell as a child process, or
+// standalone:
 //
-// Serves the VS Code *web* build (the assets the workbench loads in a browser)
-// to the embedded view. Launch by the V shell as a child process, or standalone:
+//   bun run web/serve.js --port 8123 --root ./public --backend ./backend.js
 //
-//   bun run web/serve.js --port 8123 --root web/public
+// The shell knows three things about HTTP and nothing else:
+//   * serve files from --root
+//   * when --upstream is set, be the ORIGIN and forward everything to it,
+//     including the WebSocket upgrade (see web/proxy.js for why the shell
+//     terminates the socket instead of letting the upstream do it)
+//   * consult the embedder plugin first, for routes only it understands
+//
+// The plugin (--backend) is an ES module:
+//   export const websocket            Bun.serve websocket handlers (optional)
+//   export const UPGRADED             the sentinel handle() returns after it has
+//                                     started an upgrade itself (optional)
+//   export async function handle(ctx) ctx = { req, url, pathname, server, root,
+//                                     noCache }; return a Response to answer, the
+//                                     UPGRADED sentinel to let Bun finish an
+//                                     upgrade, or undefined to fall through.
+// That is the whole contract. Everything an application needs to know about
+// itself lives in that file, not here.
 
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
-import { handleBackend, websocket, UPGRADED } from './backend.js'
 import { handleProxyUpgrade, isUpgrade, proxyRequest, proxyWebsocket, UPGRADED as PROXY_UPGRADED } from './proxy.js'
 
 const argv = process.argv.slice(2)
@@ -21,21 +38,28 @@ const port = Number(opt('port', process.env.VSHELL_PORT ?? '8123'))
 const host = opt('host', process.env.VSHELL_HOST ?? '127.0.0.1')
 const root = opt('root', process.env.VSHELL_WEB_ROOT ?? join(import.meta.dir, 'public'))
 const base = root.replace(/[\\/]+$/, '')
-// When set (`--upstream`, or `--reh` from the shell), this server becomes the origin:
-// everything that is not ours is forwarded to a vscode-reh-web. See web/proxy.js for
-// why the shell terminates the WebSocket instead of letting the REH do it.
+// When set, this server becomes the origin of an upstream it fronts
+// (--upstream, or --proxy from the shell): everything not answered by the
+// plugin or by --root is forwarded. See web/proxy.js.
 const upstream = opt('upstream', process.env.VSHELL_UPSTREAM ?? '')
-// The REH marks everything under /static with `Cache-Control: max-age=31536000` and
-// sends no validator, which is right for a released build and wrong while iterating:
-// the workbench is one 38 MB module, so WebKit keeps the old copy and every change
-// looks like it did nothing. `--no-cache` answers `no-store` from then on; a stale
-// entry already in the cache needs a different origin to be replaced, i.e. a
-// different --port (rewriting the URLs instead is blocked by the page's CSP, which
-// pins its inline scripts by hash).
+// Some builds mark their bundles as immutable and send no validator, which is
+// right for a released build and wrong while iterating: the page keeps the old
+// copy and every change looks like it did nothing. `--no-cache` answers
+// `no-store` from then on; an entry already in the cache needs a different
+// origin (a different --port) to be replaced.
 const noCache = argv.includes('--no-cache') || process.env.VSHELL_NO_CACHE === '1'
 // VSHELL_ACCESS_LOG=1 logs every request: handy to watch the embedded engine
-// load the workbench (the V shell inherits the env and passes it to this child).
+// load a page (the V shell inherits the env and passes it to this child).
 const accessLog = process.env.VSHELL_ACCESS_LOG === '1'
+
+// The embedder plugin. A relative path resolves against the working directory,
+// which is the shell's, so `--backend server/backend.js` behaves the same as the
+// absolute form a launcher passes.
+const backendOpt = opt('backend', process.env.VSHELL_BACKEND ?? '')
+const backendPath = backendOpt === '' ? '' : isAbsolute(backendOpt) ? backendOpt : join(process.cwd(), backendOpt)
+// A Windows path is not a module specifier: it has to become a file:// URL or
+// the import fails with ERR_UNSUPPORTED_ESM_URL_SCHEME.
+const plugin = backendPath === '' ? undefined : await import(pathToFileURL(backendPath).href)
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -63,79 +87,30 @@ const extOf = (p) => {
   return i === -1 ? '' : p.slice(i).toLowerCase()
 }
 
-// ---- workbench host page ---------------------------------------------------
-//
-// out/vs/code/browser/workbench/workbench.html is a TEMPLATE: VS Code's own
-// server fills its {{...}} placeholders (see src/vs/server/node/webClientServer.ts).
-// Two things differ in this build:
-//   * the esbuild pipeline this fork builds with emits
-//     out/vs/workbench/workbench.web.main.internal.{js,css}, while the template
-//     still names the legacy out/vs/code/browser/workbench/workbench.{js,css}
-//   * the build runs with NLS off (VSHELL_NLS), so no nls.messages.js exists and
-//     the two NLS module scripts are dropped instead of 404ing
-const TEMPLATE_PATH = base + '/out/vs/code/browser/workbench/workbench.html'
-const CALLBACK_PATH = '/out/vs/code/browser/workbench/callback.html'
-
-// product versions and the built-in extensions list are already compiled into the
-// bundle (build/lib/gulpfile.vscode.web.ts replaces INSERT_PRODUCT_CONFIGURATION
-// and INSERT_BUILTIN_EXTENSIONS), so the host only supplies what is read at runtime.
-// The JSON goes inside an HTML attribute, so its quotes must be escaped — exactly
-// what VS Code's asJSON() does (src/vs/server/node/webClientServer.ts).
-const WORKBENCH_CONFIG = JSON.stringify({ callbackRoute: CALLBACK_PATH }).replace(/"/g, '&quot;')
-
-// the bundle name is stable-ish but the suffix has changed once; probe the known ones
-async function findMainBundle(ext) {
-  for (const name of ['workbench.web.main.internal', 'workbench.web.main', 'workbench.web']) {
-    const rel = `/out/vs/workbench/${name}${ext}`
-    if (await Bun.file(base + rel).exists()) return rel
-  }
-  return undefined
-}
-
-async function renderHostPage() {
-  let html = await Bun.file(TEMPLATE_PATH).text()
-
-  html = html
-    .replaceAll('{{WORKBENCH_WEB_BASE_URL}}', '')            // root-relative URLs
-    .replaceAll('{{WORKBENCH_WEB_CONFIGURATION}}', WORKBENCH_CONFIG)
-    .replaceAll('{{WORKBENCH_AUTH_SESSION}}', '')            // no auth session (the server passes '' too)
-
-  // no NLS files were built: drop those two script tags instead of 404ing
-  html = html.replace(/^.*\{\{WORKBENCH_NLS_(?:FALLBACK_)?URL\}\}.*\r?\n/gm, '')
-
-  // The template names out/vs/code/browser/workbench/workbench.{js,css}. The JS
-  // bootstrap is built (buildfile.codeWeb); that entry's CSS is not, so map only
-  // the files that are actually missing onto the main bundle.
-  for (const ext of ['.js', '.css']) {
-    const legacy = `/out/vs/code/browser/workbench/workbench${ext}`
-    if (await Bun.file(base + legacy).exists()) continue
-    const found = await findMainBundle(ext)
-    if (found) {
-      html = html.replaceAll(legacy, found)
-    } else {
-      console.warn(`vshell-web: WARNING neither ${legacy} nor a workbench.web.main${ext} fallback exist`)
-    }
-  }
-
-  return html
-}
-
 const server = Bun.serve({
   hostname: host,
   port,
-  // The terminal (web/backend.js) tunnels a PTY over a WebSocket, so the server
-  // needs the handlers; the upgrade itself is decided in the fetch below. In proxy
-  // mode the only socket is the remote agent's, and it is piped to the REH.
-  websocket: upstream ? proxyWebsocket : websocket,
+  // Bun needs the websocket handlers up front, so the plugin supplies them when
+  // it wants one; the upgrade itself is decided in the fetch below.
+  websocket: plugin?.websocket ?? (upstream ? proxyWebsocket : undefined),
   async fetch(req) {
     const url = new URL(req.url)
-    // Collapse repeated slashes: the template computes its file root as
-    // `new URL(<base>, origin) + '/out/'`, which yields '//out/...'.
+    // Collapse repeated slashes: the host page computes its file root from its
+    // own URL, which yields '//out/...'.
     const pathname = decodeURIComponent(url.pathname).replace(/\/{2,}/g, '/')
     if (accessLog) console.log(`vshell-web: ${req.method} ${pathname}`)
 
+    // The embedder first, before both the proxy and the static root: its routes
+    // are the ones a file or an upstream path could otherwise shadow. On a
+    // successful upgrade it returns its own UPGRADED and this fetch must yield
+    // undefined so Bun completes the handshake itself.
+    if (plugin?.handle) {
+      const answer = await plugin.handle({ req, url, pathname, server, root: base, noCache })
+      if (answer === plugin.UPGRADED) return undefined
+      if (answer) return answer
+    }
+
     if (upstream) {
-      // Proxy mode: this process is the origin for the workbench the REH serves.
       if (isUpgrade(req)) {
         const r = handleProxyUpgrade(req, url, server, upstream)
         if (r === PROXY_UPGRADED) return undefined
@@ -144,28 +119,7 @@ const server = Bun.serve({
       return proxyRequest(req, url, upstream, { noCache })
     }
 
-    // The Codebun backend (filesystem, terminal). Mounted before the static
-    // handling so no file named like a route can shadow it. See web/backend.js.
-    // It also owns the WebSocket upgrade, which is why it is handed `server`:
-    // on a successful upgrade it returns UPGRADED and this fetch must yield
-    // undefined so Bun can complete the handshake itself.
-    const backend = await handleBackend(req, pathname, server)
-    if (backend === UPGRADED) {
-      return undefined
-    }
-    if (backend) return backend
-
-    // The workbench host page (a rendered template, not a static file).
-    if (pathname === '/' || pathname === '/index.html') {
-      return new Response(await renderHostPage(), {
-        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
-      })
-    }
-
-    // packageTask() copies resources/server/* to the root of the build, while the
-    // template asks for them under /resources/server/.
-    const alias = pathname.match(/^\/resources\/server\/(.+)$/)
-    const filePath = alias ? `${base}/${alias[1]}` : base + pathname
+    const filePath = base + (pathname.endsWith('/') ? pathname + 'index.html' : pathname)
     const file = Bun.file(filePath)
 
     if (!(await file.exists())) {
@@ -183,5 +137,6 @@ const server = Bun.serve({
 })
 
 console.log(`vshell-web: root=${base}`)
+if (plugin) console.log(`vshell-web: backend=${backendPath}`)
 if (upstream) console.log(`vshell-web: proxying to ${upstream}`)
 console.log(`vshell-web: listening on http://${host}:${server.port}/`)

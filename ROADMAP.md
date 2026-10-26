@@ -1,10 +1,32 @@
 # Roadmap — vshell
 
-Goal: a **desktop shell of our own, written in V**, that shows the VS Code **web**
-workbench using **WebKit + JavaScriptCore** (no V8), with a **Bun** server.
+Goal: a **desktop shell of our own, written in V**, as an alternative to Electron:
+a window with **WebKit + JavaScriptCore** (no V8) around any web application, plus a
+**Bun** server that can act as the page's origin.
 
-Overall success criterion: open a folder, edit code with LSP, use the integrated
-terminal and see the test extension — all from `vshell.exe`.
+Overall success criterion: an application can be *driven* by this shell — folder,
+editor, language server, integrated terminal — without a single line of that
+application's policy living in this repository.
+
+---
+
+## Boundary (read before the phases)
+
+The phases below were written while the shell and its first application lived in the
+same repo. That is no longer true, and the split is now a rule:
+
+| | owns |
+|---|---|
+| **vshell** (this repo) | the window, the engine, the static root, the HTTP/WS proxy that terminates sockets, the job object that owns children, the `window.vshell` bridge, menus and payloads as data, and the HTTP **plugin slot** (`--backend`) |
+| **codebun** (separate repo) | the VS Code checkout and its Bun patches, the web/REH builds, the browser extension (file system provider, terminal, menu mapping), the session-token protocol, the launcher |
+
+Consequences for the history below: `scripts/build_web.sh`, `scripts/build_reh.sh`,
+`scripts/lib/*`, `scripts/tools/*`, `extensions/codebun-backend/`, `web/backend.js`,
+the root `package.json` and `docs/perf-trim.md` **moved to the codebun repo**. The
+shell flags they used are now data flags: `--reh <url>` became `--proxy <url>`,
+`--reh-run <dir>` became `--run bun --run-arg …/server-main.js --proxy …`, and the
+token/folder bootstrap became `--inject` + `--script`. Phases 0-3 are kept verbatim
+as the record of what was measured; read them with that mapping in mind.
 
 ---
 
@@ -238,7 +260,7 @@ Status after the first spike (`scripts/build_reh.sh`, 2026-10-25):
       `Sec-WebSocket-Accept` were verified byte for byte — but our WebKit never fires
       `open` and dies with `1006`. WebKit ↔ `Bun.serve` works, and Bun *as a client*
       of the REH works. So the shell now owns the origin and pipes the socket
-      (`web/proxy.js`, `--reh`). It also forwards `x-forwarded-host`, because the REH
+      (`web/proxy.js`, `--proxy`). It also forwards `x-forwarded-host`, because the REH
       derives the workbench's `remoteAuthority` from it — without that header the page
       sends the client straight to the REH and the socket breaks again.
 - [x] Activate a real Node extension — the point of the whole route. Two Bun gaps had
@@ -300,7 +322,7 @@ The first honest numbers, and what fixed them:
 | workbench ready | 19-32 s of CPU before the page could even open its socket | 3.3-5 s | the WebKit web process was parsing twice the code |
 | boot RAM (web process) | ~700 MB | ~400-480 MB | same |
 | idle wakeups | 125/s (8 ms tick forever) | ~5/s, adaptive | the message loop now waits 200 ms unless the shell has queued work (page not ready, evals pending, title-poll fallback); input arrives as a message, so responsiveness is unaffected |
-| orphaned processes | 4 proxies + 4 file watchers ≈ 340 MB after a dozen runs | 0 | a **job object** with `KILL_ON_JOB_CLOSE`: one assignment on the child covers the whole tree, and it is what `--reh-run` uses to own the REH |
+| orphaned processes | 4 proxies + 4 file watchers ≈ 340 MB after a dozen runs | 0 | a **job object** with `KILL_ON_JOB_CLOSE`: one assignment on the child covers the whole tree, and it is what `--run` relies on to own an upstream |
 
 Measured idle, workbench mounted, no folder open: shell 0.3 %, web 1.9 %, GPU 0.8 %,
 network 0.6 %.

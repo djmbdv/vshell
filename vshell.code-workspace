@@ -1,29 +1,31 @@
 // vshell workspace.
 //
-// vshell is a standalone project (its own git repo) that CONSUMES the VS Code fork,
-// so both folders are opened together and each one keeps its own git in the Source
-// Control view. Inside the fork's repo, `vshell/` would be invisible: its
-// .gitignore ignores `VS*` folders and on Windows that match is case-insensitive.
+// vshell is a standalone project (its own git repo). Here it happens to live inside
+// the codebun checkout, which is where the application that consumes it lives, so
+// both folders are opened together and each keeps its own git in Source Control.
+// Neither repo should depend on that layout: `bin/codebun` also works with the two
+// cloned side by side (VSHELL_BIN overrides the lookup).
 {
   "folders": [
     {
-      // The VS Code / VSCodium fork (build inputs, patches, configuration).
-      "name": "codebun (vscode fork)",
+      // The application: the VS Code fork, its Bun patches, the builds, the extension.
+      "name": "codebun",
       "path": ".."
     },
     {
-      // The V shell: Ultralight binding, JS<->V bridge, Bun server.
+      // The shell: the window, the engine, the origin, the bridge.
       "name": "vshell",
       "path": "."
     }
   ],
   "settings": {
     // The generated artifacts are huge (the workbench bundle alone is ~38 MB, and
-    // the vscode checkout is tens of MB more): keep them out of searches so they
-    // do not drown the results.
+    // the checkout is hundreds of MB more): keep them out of searches so they do
+    // not drown the results.
     "search.exclude": {
       "**/.work": true,
-      "**/web/public": true
+      "**/web/public": true,
+      "**/bin": true
     }
   }
 }

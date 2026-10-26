@@ -23,6 +23,7 @@ module engine
 // declared at the beginning of the file", even though the default compiler
 // accepts it, so the order here is deliberate.
 import json2
+import os
 import time
 
 #include "engine/wk_host.h"
@@ -125,18 +126,27 @@ fn wk_cstr(p voidptr) string {
 // packs name and payload with an ASCII unit separator (0x1F) that cannot appear
 // in a method name. Swap for x.json2 if you prefer typed decoding.
 //
-// The script is NOT a const any more: it carries the shell's session token and
-// the folder it opened, which are per-run. See build_user_script().
+// The script is NOT a const any more: it carries the host payload, which is
+// per-run. See build_user_script().
 const vshell_user_script_head = '
 (function () {
 	// Idempotent: the shell injects this twice on purpose — as a WKUserScript at
 	// document start, and again by evaluation after the load, because a page with a
-	// strict Content-Security-Policy (vscode-reh-web sends one) blocks the inline
-	// injection and would otherwise leave the page with no bridge at all.
+	// strict Content-Security-Policy blocks the inline injection and would
+	// otherwise leave the page with no bridge at all.
 	if (window.vshell) { return; }
-	var pending = {}, seq = 0;
+	var pending = {}, seq = 0, listeners = {};
 	window.vshell = Object.freeze({
 		version: "vshell-bridge-wk",
+		// host is the payload the embedder passed with --inject, delivered before
+		// the first document loads. The shell never looks inside it: a workspace
+		// folder, a session token and a colour theme are all the same thing here,
+		// and an empty object is the standalone case.
+		host: __VSHELL_HOST__,
+		// errors is filled by the tail below and read back from outside the page.
+		// It has to live on the frozen object: adding a property later would
+		// silently do nothing on a frozen target.
+		errors: [],
 		post: (name, payload) => window.webkit.messageHandlers.vshell.postMessage(
 			String(name) + "\u001f" + (payload === undefined ? "" : String(payload))),
 		// Request/response over the one-way post() channel: the page sends a call
@@ -150,6 +160,17 @@ const vshell_user_script_head = '
 				window.vshell.post("vshell.call", JSON.stringify({ id: id, method: method, args: args || [] }));
 			});
 		},
+		// on(name, cb) subscribes to shell -> page events. The shell emits "menu"
+		// for every native menu command it does not handle itself; anything it
+		// grows later arrives through the same door.
+		on: function (name, cb) {
+			(listeners[name] = listeners[name] || []).push(cb);
+		},
+		__emit: function (name, value) {
+			var l = listeners[name];
+			if (!l) { return; }
+			for (var i = 0; i < l.length; i++) { try { l[i](value); } catch (err) {} }
+		},
 		dialog: {
 			openFolder: function () { return window.vshell.call("dialog.openFolder"); },
 		},
@@ -161,96 +182,31 @@ const vshell_user_script_head = '
 })();
 '
 
-// The bootstrap tail is appended to the head above. It is delivered to the page
-// as a WKUserScript at document start, so unlike everything the Bun server
-// serves it never appears in an HTTP response another local process could fetch
-// — the token only reaches a context the engine itself injected. The page then
-// re-broadcasts it on a same-origin BroadcastChannel, which is how the extension
-// host worker (which has no `window`) gets it. See extensions/codebun-backend.
+// The diagnostics tail is appended to the head above. The engine has no console
+// hook in this C API (console messages need an injected bundle), so page errors
+// are collected here and read back from outside with `--eval` over
+// window.vshell.errors. A page that renders but silently fails to do something
+// would otherwise be indistinguishable from a working one, and this is the
+// cheapest substitute that is always available.
+//
+// No quote characters in these comments: they live inside a V single-quoted
+// string literal, which has already truncated this file once.
 const vshell_user_script_tail = '
 (function () {
-	if (window.__codebunBootstrap) { return; }
-	// Last-resort diagnostics for the shell: the engine has no console hook in the
-	// C API (console messages need an injected bundle), so errors are collected here
-	// and read back with --eval and JSON.stringify(window.__codebunErrors). A page
-	// that renders but silently fails to do something (the remote connection, for
-	// one) is otherwise indistinguishable from a working one. No quote characters in
-	// this comment: it lives inside a V single-quoted string literal.
-	window.__codebunErrors = [];
+	if (!window.vshell || window.__vshellDiag) { return; }
+	window.__vshellDiag = true;
+	var errors = window.vshell.errors;
 	window.addEventListener("error", function (e) {
-		try { window.__codebunErrors.push("error: " + (e.message || e.error || e)); } catch (err) {}
+		try { errors.push("error: " + (e.message || e.error || e)); } catch (err) {}
 	});
 	window.addEventListener("unhandledrejection", function (e) {
 		try {
 			var r = e && e.reason;
-			window.__codebunErrors.push("rejection: " + ((r && (r.stack || r.message)) || String(r)));
+			errors.push("rejection: " + ((r && (r.stack || r.message)) || String(r)));
 		} catch (err) {}
 	});
-	var boot = { token: "%TOKEN%", folder: "%FOLDER%" };
-	window.__codebunBootstrap = boot;
-	// One dialog at a time, per request id. The extension re-sends its request
-	// every 250 ms until it gets a reply, because a BroadcastChannel has no replay
-	// and either side may have started late. Without this, every retry while the
-	// (modal!) folder dialog is open would queue another dialog.
-	var picking = {};
-	try {
-		var bc = new BroadcastChannel("codebun-bootstrap");
-		bc.onmessage = function (ev) {
-			var d = ev && ev.data;
-			if (!d) return;
-			if (d.type === "codebun:hello") {
-				bc.postMessage({ type: "codebun:bootstrap", token: boot.token, folder: boot.folder });
-			} else if (d.type === "codebun:pickFolder") {
-				if (picking[d.id]) return;
-				picking[d.id] = true;
-				window.vshell.dialog.openFolder().then(function (f) {
-					delete picking[d.id];
-					bc.postMessage({ type: "codebun:folderPicked", id: d.id, folder: f || "" });
-				});
-			}
-		};
-		// Native menu -> workbench. The shell owns the menu and forwards the
-		// commands it does not handle itself (see run_menu_command in webkit.v); the
-		// extension maps them to VS Code commands. Published as a global because the
-		// engine evaluates it from outside this closure.
-		window.__codebunMenu = function (command) {
-			try { bc.postMessage({ type: "codebun:menu", command: String(command) }); } catch (err) {}
-		};
-		bc.postMessage({ type: "codebun:bootstrap", token: boot.token, folder: boot.folder });
-	} catch (err) {}
 })();
 '
-
-// escape_for_js_string makes a value safe inside a double-quoted JS string
-// literal (the token and the folder path are interpolated into the tail above).
-// Only the bytes that would end the literal or break the source are escaped:
-// '\\' and '"' get a backslash, the usual whitespace gets its short form, and
-// other control bytes are dropped. Bytes >= 0x20 pass through untouched, so a
-// UTF-8 path stays UTF-8 — which is what WKStringCreateWithUTF8CString wants.
-fn escape_for_js_string(s string) string {
-	mut out := []u8{cap: s.len + 8}
-	for c in s.bytes() {
-		if c == 92 { // backslash
-			out << u8(92)
-			out << u8(92)
-		} else if c == 34 { // double quote
-			out << u8(92)
-			out << u8(34)
-		} else if c == 10 { // newline
-			out << u8(92)
-			out << u8(110)
-		} else if c == 13 { // carriage return
-			out << u8(92)
-			out << u8(114)
-		} else if c == 9 { // tab
-			out << u8(92)
-			out << u8(116)
-		} else if c >= 32 {
-			out << c
-		}
-	}
-	return out.bytestr()
-}
 
 // pick_folder_owned is the one place that calls the C dialog. `parent` is the
 // owner HWND: NULL for the startup prompt (no window yet), the frame's HWND for
@@ -344,11 +300,10 @@ mut:
 	t0 time.Time
 
 	// Per-run values handed to the page as a user script (build_user_script):
-	// the shell's session token for the Bun backend, and the folder the user
-	// opened. Both default to '' — with no token the backend stays open, which is
-	// only meant for standalone development.
-	boot_token  string
-	boot_folder string
+	// the host payload (opaque JSON from --inject) and the extra scripts from
+	// --script. Both are empty by default, which is the standalone case.
+	host_payload  string = '{}'
+	extra_scripts []string
 
 	// Menu: Win32 gives items integer ids, so the shell's command strings are
 	// mapped through this table. `pending_menu` is what WM_COMMAND produced and
@@ -358,8 +313,8 @@ mut:
 	pending_menu  string
 	// bridge_injected tracks the by-evaluation injection for the current document.
 	// The WKUserScript covers the common case, but a page with a strict CSP
-	// (vscode-reh-web) blocks inline user scripts, so the pump injects again after
-	// the load; the script itself is idempotent. Reset on every navigation.
+	// blocks inline user scripts, so the pump injects again after the load; the
+	// script itself is idempotent. Reset on every navigation.
 	bridge_injected bool
 }
 
@@ -370,7 +325,7 @@ const title_poll_ticks = 30
 
 // What Help > About shows. A const so the text does not have to be a C literal
 // with hand-escaped newlines at the call site.
-const about_text = 'vshell - a V shell for the VS Code web build.\n\nRenderer: WebKit (WinCairo), JavaScriptCore\nServer: Bun, JavaScriptCore'
+const about_text = 'vshell - a WebKit shell written in V.\n\nRenderer: WebKit (WinCairo) / JavaScriptCore\nWindow: Win32, one process per renderer'
 
 // --- callbacks invoked from the C thunks ------------------------------------
 fn wk_on_close(ctx voidptr) {
@@ -430,21 +385,33 @@ fn wk_on_eval(value voidptr, err_ref voidptr, ctx voidptr) {
 
 // --- Engine interface -------------------------------------------------------
 
-// set_bootstrap records what the page will be told through the injected user
-// script. Call it BEFORE create_window: the script is registered there and runs
-// at document start, so a later value would miss the first document.
-pub fn (mut e WebKitEngine) set_bootstrap(token string, folder string) {
-	e.boot_token = token
-	e.boot_folder = folder
+// set_host records the payload and the scripts the page will be given through
+// the injected user script. Call it BEFORE create_window: the script is
+// registered there and runs at document start, so a later value would miss the
+// first document.
+//
+// `payload_json` must be a JSON object; empty means {}. The shell does not
+// interpret it — that is the whole point of the boundary. `scripts` are file
+// paths whose contents run after the bridge, wrapped so one of them cannot break
+// the rest (the same role as a preload script in a browser shell).
+pub fn (mut e WebKitEngine) set_host(payload_json string, scripts []string) {
+	e.host_payload = if payload_json.trim_space() == '' { '{}' } else { payload_json }
+	e.extra_scripts = scripts
 }
 
 // build_user_script renders the page-side bridge for this run: the frozen
-// vshell object plus the bootstrap tail carrying the token and the folder.
+// vshell object carrying the host payload, the diagnostics tail, and whatever
+// the embedder asked to inject after them.
 fn (e WebKitEngine) build_user_script() string {
-	tail := vshell_user_script_tail
-		.replace('%TOKEN%', escape_for_js_string(e.boot_token))
-		.replace('%FOLDER%', escape_for_js_string(e.boot_folder))
-	script := vshell_user_script_head + tail
+	mut script := vshell_user_script_head.replace('__VSHELL_HOST__', e.host_payload) +
+		'\n' + vshell_user_script_tail
+	for path in e.extra_scripts {
+		body := os.read_file(path) or {
+			eprintln('vshell: could not read ${path}: ${err}')
+			continue
+		}
+		script += '\n;(function(){\n' + body + '\n})();\n'
+	}
 	// A truncated bridge fails SILENTLY — the page simply has no `window.vshell`,
 	// and the only symptom is every call answering undefined. That happened once:
 	// a comment inside one of the string literals above contained two single quotes,
@@ -521,10 +488,10 @@ fn (mut e WebKitEngine) run_menu_command(command string) {
 			C.wk_host_message_box(e.host, c'About vshell', about_text.str)
 		}
 		else {
-			// Everything else belongs to the workbench: it is the side that knows
-			// what the command means (the extension listens for it on the
-			// bootstrap BroadcastChannel).
-			e.eval_js('window.__codebunMenu ? window.__codebunMenu(${json2.encode(command)}) : undefined') or {
+			// Everything else belongs to the embedder: only it knows what the command
+			// means, so it is forwarded to the page as a `menu` event and the shell
+			// keeps its hands off it.
+			e.eval_js('window.vshell && window.vshell.__emit ? window.vshell.__emit("menu", ${json2.encode(command)}) : undefined') or {
 				eprintln('vshell: could not deliver the menu command "${command}": ${err}')
 			}
 		}
@@ -745,8 +712,8 @@ fn (mut e WebKitEngine) pump() {
 	}
 	// Second chance for the bridge. A page served with a strict CSP blocks the
 	// document-start user script (the injection is inline and carries no nonce), so
-	// the page would come up with no `window.vshell`, no bootstrap and no error
-	// collector — which is exactly what vscode-reh-web did. Evaluating the same
+	// the page would come up with no `window.vshell` and no error collector —
+	// which is exactly what a page with a strict CSP does. Evaluating the same
 	// script is not subject to CSP. The script returns early if it already ran, so
 	// the normal case pays one cheap call and nothing else.
 	//

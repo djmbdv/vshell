@@ -1,5 +1,35 @@
 # Architecture — vshell
 
+## 0. What the shell is responsible for
+
+`vshell` is an Electron alternative: a window, an engine, and the plumbing an
+application needs to be *hosted*. It is deliberately ignorant of the application
+inside it, and that ignorance is load-bearing — it is what lets the same shell host
+a second app without an `if`.
+
+| the shell provides (mechanism) | the embedder provides (policy) |
+|---|---|
+| Win32 window, per-monitor DPI, title/URL sync | which URL to load |
+| static HTTP root (`--serve`), origin-terminating HTTP/WS proxy (`--proxy`), child launcher (`--run`) | what the app is, where its data lives, how it is built |
+| one job object per shell (`KILL_ON_JOB_CLOSE`) | which children to start |
+| `window.vshell`: `post`, `call`, `host`, `on`, `dialog.openFolder`, `errors` | what the payload means |
+| Win32 menu bar from JSON; unowned commands become `menu` events | every command's name and meaning |
+| an HTTP plugin slot (`--backend`) with first refusal on every request | every route, including a rendered host page |
+
+`--inject` (payload), `--script` (preload), `--menu` (bar) and `--backend` (routes)
+are the entire surface between the two. Nothing else crosses.
+
+The reference embedder is **codebun** (a VS Code distribution on Bun), in its own
+repository: it owns the checkout and its Bun patches, the web/REH builds, the
+browser extension, the session-token/BroadcastChannel protocol and the launcher.
+Earlier revisions of this document described those pieces here; they moved, together
+with `scripts/build_web.sh`, `scripts/build_reh.sh`, `scripts/lib/*`,
+`scripts/tools/*`, `extensions/codebun-backend/` and `web/backend.js`.
+
+Flag mapping from those revisions: `--reh <url>` → `--proxy <url>`,
+`--reh-run <dir>` → `--run bun --run-arg <dir>/out/server-main.js --proxy …`, and the
+token/folder bootstrap → `--inject` + `--script`.
+
 ## 1. Concept
 
 **Desktop** VS Code (Electron) cannot run outside Electron. What *does* run in any
@@ -104,9 +134,9 @@ VS Code's `ws` on `node:http`, and under Bun our WebKit never sees `open` — th
 handshake is completed server-side with a correct `101`, then the client dies with
 `1006` after ~10 s. WebKit ↔ `Bun.serve` works, and Bun as a *client* of the REH
 works, so the shell now owns the origin and pipes the socket (`web/proxy.js`,
-`--reh <url>`). That, plus forwarding `x-forwarded-host` (the source of the page's
+`--proxy <url>`). That, plus forwarding `x-forwarded-host` (the source of the page's
 `remoteAuthority`), is what finally let the **remote extension host start on Bun**.
-It is a proxy, not a reimplementation: the protocol stays VS Code's.
+It is a proxy, not a reimplementation: the protocol stays the upstream's.
 
 ### 3.2 Opening a folder: never through the URL
 
@@ -149,20 +179,27 @@ Both values are known before the window exists and must reach the *page* before 
 first document runs, so they cannot travel as an HTTP response and must not travel in
 the URL (a URL is logged, cached and fetchable by any local process; §3.2 shows what
 happens when state is threaded through `location.href`). The engine injects them as a
-`WKUserScript` at document start (`engine/webkit.v`, `build_user_script`):
+`WKUserScript` at document start (`engine/webkit.v`, `build_user_script`), straight
+from the `--inject` payload:
 
 ```
-window.__codebunBootstrap = { token, folder }      // inspection / debugging
+window.vshell.host                                  // the payload, verbatim
+window.__codebunBootstrap = { token, folder }       // codebun's --script reads it from there
 BroadcastChannel("codebun-bootstrap").postMessage({ type: "codebun:bootstrap", ... })
 ```
+
+The first line is the shell's; the other two are the embedder's, and they are all in
+`codebun/integration/bridge.js` — the shell has no notion of a token or a folder
+beyond the one flag (`--folder`, which merges `"folder"` into the payload because the
+shell is the only side that can show the native dialog).
 
 The extension host worker listens on the same channel, and repeats its `hello` every
 250 ms until a reply arrives — a channel has no replay, and either side may start
 after the other. From then on the token rides on every request as
 `X-Codebun-Token`; the terminal passes the same secret as `?token=` because a
-`WebSocket` built by the page cannot set headers. `web/backend.js` checks the token
-before routing anything, so the check is inherited by every endpoint that is added
-later.
+`WebSocket` built by the page cannot set headers. `codebun/server/backend.js` checks
+the token before routing anything, so the check is inherited by every endpoint that is
+added later.
 
 The page also relays `codebun:pickFolder` to the shell, which answers with
 `window.vshell.call("dialog.openFolder")` → the native `IFileOpenDialog`

@@ -4,11 +4,11 @@
 #   sh scripts/run.sh [--rebuild] [vshell args...]
 #
 # Anything that is not --rebuild is forwarded to vshell.exe. With no arguments it
-# supplies the defaults the shell needs to find the web build:
-#   --engine webkit --port 8123 --web-root web/public
+# supplies the defaults that make a bare `web/public` tree viewable:
+#   --engine webkit --port 8123 --serve web/public
 #
 # Must run from the project root (it cd's there itself): main.v resolves
-# web/serve.js and web/public relative to the working directory.
+# web/serve.js relative to the working directory when it is there.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -33,14 +33,6 @@ if ! command -v bun >/dev/null 2>&1; then
 	exit 1
 fi
 
-# --- the web artifact must exist ---------------------------------------------
-if [ ! -f "web/public/out/vs/code/browser/workbench/workbench.js" ]; then
-	echo "ERROR: web/public has no build yet." >&2
-	echo "       run: sh scripts/build_web.sh" >&2
-	echo "       (or 'VSHELL_FAST=1 sh scripts/build_web.sh' to reuse .work)" >&2
-	exit 1
-fi
-
 # --- the shell binary --------------------------------------------------------
 rebuild=0
 args=()
@@ -58,12 +50,17 @@ if [ "$rebuild" = "1" ] || [ ! -x "bin/vshell.exe" ]; then
 fi
 
 # --- run ---------------------------------------------------------------------
-# Default: WebKit engine against the served build, and ask for a folder with the
-# shell's native dialog (vshell --open-folder -> engine/wk_host.h). Cancelling the
-# dialog is fine: the shell just starts without a workspace. Pass --folder <path>
-# to skip the dialog, or any other vshell args to override.
+# The shell is generic: it serves a directory and opens a window on it. With no
+# arguments, serve the tree next to this repo's web/ (an embedder normally passes
+# its own --serve, --proxy, --inject, --script, --menu and --backend instead).
+# `--open-folder` is the shell's native dialog; it only records a folder in the
+# payload, so a bare page simply ignores it.
 if [ "${#args[@]}" -eq 0 ]; then
-	args=(--engine webkit --port 8123 --web-root web/public --open-folder)
+	if [ -d "web/public" ]; then
+		args=(--engine webkit --port 8123 --serve web/public)
+	else
+		args=(--engine webkit --port 8123 --eval 'document.title')
+	fi
 fi
 
 echo "==> vshell ${args[*]}"

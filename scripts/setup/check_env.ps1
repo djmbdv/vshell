@@ -38,4 +38,4 @@ Write-Host '      perl Tools/Scripts/build-webkit --release     (in a WebKit/Web
 Write-Host '      WK_SRC=... WK_BUILD=... sh scripts/stage_runtime.sh'
 Write-Host '    build_vshell.sh runs that staging for you the first time.'
 Write-Host '  - (legacy backend only) Ultralight SDK: https://ultralig.ht/download'
-Write-Host '  - vscode-web build: sh scripts/build_web.sh'
+Write-Host '  - what to show: an embedder passes --serve <dir> or --proxy <url> (see README)'
